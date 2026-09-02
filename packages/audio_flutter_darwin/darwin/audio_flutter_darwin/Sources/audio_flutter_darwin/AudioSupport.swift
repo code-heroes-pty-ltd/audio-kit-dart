@@ -55,6 +55,10 @@ enum AudioTypedData {
 /// artifacts.
 final class PersistentAudioConverter {
   let outputFormat: AVAudioFormat
+  /// The format this converter was built to read. Callers that receive buffers
+  /// whose format they did not choose — a tap installed without an asserted
+  /// format — compare against this to know when to rebuild.
+  let inputFormat: AVAudioFormat
   private let converter: AVAudioConverter
 
   init?(inputFormat: AVAudioFormat, sampleRate: Double, channelCount: AVAudioChannelCount) {
@@ -68,6 +72,7 @@ final class PersistentAudioConverter {
       let converter = AVAudioConverter(from: inputFormat, to: output)
     else { return nil }
     outputFormat = output
+    self.inputFormat = inputFormat
     self.converter = converter
   }
 

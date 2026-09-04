@@ -4,6 +4,8 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <mediaobj.h>
+#include <dmort.h>
+#include <uuids.h>
 #include <wmcodecdsp.h>
 #include <propvarutil.h>
 // clang-format on

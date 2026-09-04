@@ -111,6 +111,9 @@ class CaptureSession {
   void Emit(SessionPhase phase, const std::string& code = std::string(),
             const std::string& message = std::string());
   void Fail(const std::string& code, const std::string& message);
+  // Reports that the microphone is being recorded without echo cancellation,
+  // and latches the refusal so the handover cannot come back.
+  void DeclineEchoCancellation(const std::string& reason);
 
   const int64_t session_id_;
   const CaptureConfig config_;
@@ -123,6 +126,10 @@ class CaptureSession {
   std::atomic<bool> running_{false};
   std::atomic<bool> finished_{false};
   std::atomic<bool> received_any_audio_{false};
+  // Set by the endpoint notification client when the default endpoint for this
+  // session's data flow moves. Polled by the capture loop, which reopens
+  // against the new device rather than recording the old one.
+  std::atomic<bool> default_endpoint_changed_{false};
   // Set once the Voice Capture DSP has refused a session, so the plain endpoint
   // stream it falls back to cannot hand the capture to the DSP again.
   std::atomic<bool> echo_cancellation_declined_{false};

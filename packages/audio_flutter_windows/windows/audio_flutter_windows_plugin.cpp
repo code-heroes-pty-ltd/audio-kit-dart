@@ -846,7 +846,11 @@ void AudioFlutterWindowsPlugin::RunOnPlatformThread(
   if (HWND window = registrar_->GetView() == nullptr
                         ? nullptr
                         : registrar_->GetView()->GetNativeWindow()) {
-    ::PostMessage(window, WM_AFW_RUN_TASK, 0, 0);
+    // GetNativeWindow() is the child Flutter view, whose window procedure
+    // discards private messages. The top-level WindowProc delegate registered
+    // in the constructor only sees messages sent to the root window, so post
+    // there or the drain never runs and every offloaded reply is lost.
+    ::PostMessage(::GetAncestor(window, GA_ROOT), WM_AFW_RUN_TASK, 0, 0);
   }
 }
 

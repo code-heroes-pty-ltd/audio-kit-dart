@@ -121,8 +121,10 @@ HRESULT SetBoolProperty(IPropertyStore* store, REFPROPERTYKEY key, bool value) {
 ///
 /// The DSP addresses devices by their index in the active-endpoint collection
 /// for their data flow, which is the same enumeration this plugin already uses
-/// to list input devices. -1 selects the system default, which is what an
-/// unspecified microphone and the speaker reference both want.
+/// to list input devices. -1 selects a default the DSP picks by an undocumented
+/// rule, which is what an unspecified microphone wants; the speaker reference
+/// is resolved by id instead, because which default it means is exactly what
+/// decides whether the echo is cancelled.
 int EndpointIndex(IMMDeviceEnumerator* enumerator, EDataFlow flow,
                   const std::string& endpoint_id) {
   if (endpoint_id.empty()) {
@@ -152,6 +154,21 @@ int EndpointIndex(IMMDeviceEnumerator* enumerator, EDataFlow flow,
     }
   }
   return -1;
+}
+
+/// Id of the endpoint Windows currently gives `role` for `flow`, or empty.
+std::string DefaultEndpointId(IMMDeviceEnumerator* enumerator, EDataFlow flow,
+                              ERole role) {
+  ComPtr<IMMDevice> device;
+  if (FAILED(enumerator->GetDefaultAudioEndpoint(flow, role, device.put())) ||
+      !device) {
+    return std::string();
+  }
+  ComTaskMem<WCHAR> id;
+  if (FAILED(device->GetId(id.put())) || !id) {
+    return std::string();
+  }
+  return Utf8FromWide(id.get());
 }
 
 }  // namespace
@@ -215,12 +232,19 @@ bool VoiceCaptureDsp::Initialize(std::string* error) {
         "the selected microphone has no endpoint index the Voice Capture DSP "
         "can address");
   }
-  // The speaker index is always the default render endpoint: it is the device
-  // the meeting is playing through, and therefore the reference the canceller
-  // has to subtract.
-  const LONG device_indexes =
-      static_cast<LONG>((static_cast<uint32_t>(-1) << 16) |
-                        (static_cast<uint32_t>(microphone_index) & 0xFFFFu));
+  // The reference the canceller subtracts has to be the endpoint the meeting
+  // plays through, which is the one the system-audio track records. -1 asks the
+  // DSP to pick "the default" by a rule it does not document, and Windows keeps
+  // several defaults that are routinely different devices, so the endpoint is
+  // resolved here with the role the rest of this plugin uses and named
+  // explicitly. A failure still falls back to -1: a canceller referencing the
+  // wrong speakers beats no capture at all.
+  const int speaker_index = EndpointIndex(
+      enumerator.get(), eRender,
+      DefaultEndpointId(enumerator.get(), eRender, eConsole));
+  const LONG device_indexes = static_cast<LONG>(
+      ((static_cast<uint32_t>(speaker_index) & 0xFFFFu) << 16) |
+      (static_cast<uint32_t>(microphone_index) & 0xFFFFu));
   if (FAILED(SetInt32Property(impl_->properties.get(),
                               MFPKEY_WMAAECMA_DEVICE_INDEXES,
                               device_indexes))) {

@@ -65,6 +65,10 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
   private var recorderFormat: AVAudioFormat?
   private var configurationObserver: NSObjectProtocol?
   private var watchdog: Task<Void, Never>?
+  /// Why the platform echo canceller could not be enabled, when it was asked
+  /// for and refused. Reported once the session reaches `running`, since a
+  /// capture that records the far end is still a working capture.
+  private var voiceProcessingFailure: String?
 
   init(
     sessionId: Int64,
@@ -115,6 +119,10 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
         try session.setPreferredInput(input)
       }
     #endif
+    // Before the format is read: the voice-processing unit presents its own
+    // format, so a read taken ahead of this describes the raw input node that
+    // is about to be replaced.
+    enableVoiceProcessingLocked()
     let input = engine.inputNode
     let inputFormat = input.outputFormat(forBus: 0)
     guard
@@ -165,6 +173,10 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     // through labeled 48 kHz — the 2x "chipmunk" recording. Read the format
     // once here and rebuild the converter from that same read, so the
     // converter and the tap can never disagree.
+    // Re-asserted here for the same reason the converter is rebuilt from a
+    // fresh read: the node this session prepared against may have been
+    // replaced since, and voice processing does not survive that.
+    enableVoiceProcessingLocked()
     let liveFormat = input.outputFormat(forBus: 0)
     guard
       liveFormat.sampleRate > 0,
@@ -224,8 +236,46 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
         callbackCount: 0
       )
     )
+    if let voiceProcessingFailure {
+      events.emit(
+        healthEvent(
+          phase: .running,
+          code: "MicrophoneVoiceProcessingUnavailable",
+          message: voiceProcessingFailure,
+          receivingAudio: false,
+          statistics: nil
+        )
+      )
+    }
     watchdog = Task { [weak self] in
       await self?.superviseDelivery()
+    }
+  }
+
+  /// Routes the input node through the platform voice-processing unit when the
+  /// request asked for it.
+  private func enableVoiceProcessingLocked() {
+    guard request.voiceProcessing == true else { return }
+    let input = engine.inputNode
+    if !input.isVoiceProcessingEnabled {
+      do {
+        try input.setVoiceProcessingEnabled(true)
+      } catch {
+        voiceProcessingFailure =
+          "The platform echo canceller could not be enabled, so the "
+          + "microphone still records audio played through the speakers: "
+          + "\(error.localizedDescription)"
+        return
+      }
+    }
+    voiceProcessingFailure = nil
+    input.isVoiceProcessingAGCEnabled = false
+    if #available(macOS 14.0, iOS 17.0, *) {
+      input.voiceProcessingOtherAudioDuckingConfiguration =
+        AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+          enableAdvancedDucking: false,
+          duckingLevel: .min
+        )
     }
   }
 
@@ -499,6 +549,10 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
         _ = AudioInputDeviceSelection.apply(uid: uid, to: engine)
       }
     #endif
+    // A reset drops the voice-processing unit and a recreate drops the whole
+    // node, so the canceller has to be re-established before the format that
+    // describes it is read.
+    enableVoiceProcessingLocked()
     // Re-read from the current engine — `probeInput` belongs to the instance
     // that may have just been replaced. The node settles onto the new hardware
     // as part of the reset, so this is the first read that can describe it.

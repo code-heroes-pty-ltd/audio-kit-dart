@@ -57,6 +57,16 @@ int64_t IntArg(const flutter::EncodableMap& map, const char* key,
   return fallback;
 }
 
+bool BoolArg(const flutter::EncodableMap& map, const char* key,
+             bool fallback) {
+  const flutter::EncodableValue* value = Find(map, key);
+  if (value == nullptr) {
+    return fallback;
+  }
+  const auto* flag = std::get_if<bool>(value);
+  return flag == nullptr ? fallback : *flag;
+}
+
 std::string StringArg(const flutter::EncodableMap& map, const char* key) {
   const flutter::EncodableValue* value = Find(map, key);
   if (value == nullptr) {
@@ -367,6 +377,7 @@ void AudioFlutterWindowsPlugin::PrepareCapture(
   config.overflow_policy =
       ParseOverflowPolicy(StringArg(arguments, "overflowPolicy"));
   config.endpoint_id = StringArg(arguments, "inputDeviceId");
+  config.voice_processing = BoolArg(arguments, "voiceProcessing", false);
   config.process_ids = ProcessIdsArg(arguments, "processIds");
 
   const flutter::EncodableValue* encoded_process_ids =

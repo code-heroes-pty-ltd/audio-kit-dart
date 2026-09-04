@@ -55,6 +55,7 @@ void main() {
         'overflowPolicy': 'dropOldest',
         'processIds': <int>[],
         'inputDeviceId': '{0.0.0.render}',
+        'voiceProcessing': false,
       });
     });
 

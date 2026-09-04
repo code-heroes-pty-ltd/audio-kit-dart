@@ -45,6 +45,11 @@ import os
     private var outputDeviceListener: AudioObjectPropertyListenerBlock?
     private var aggregateRateListener: AudioObjectPropertyListenerBlock?
     private var aggregateRateListenerDevice = AudioObjectID(kAudioObjectUnknown)
+    private var aggregateStreamListener: AudioObjectPropertyListenerBlock?
+    private var aggregateStreamListenerDevice = AudioObjectID(kAudioObjectUnknown)
+    /// Input channels the current chain's IO proc expects the aggregate to
+    /// present: the tap's own, and nothing in front of them.
+    private var deliveredInputChannels: UInt32 = 0
     private var ioProcId: AudioDeviceIOProcID?
     private var assembler: CaptureFrameAssembler
     private var converter: PersistentAudioConverter?
@@ -288,7 +293,17 @@ import os
       )
     }
 
-    private func rebuild() -> Bool {
+    /// Puts a freshly rebuilt chain back under supervision.
+    private func restartSupervisionLocked() {
+      watchdog?.cancel()
+      let baseline = assembler.statistics().nonZeroFrameCount
+      watchdog = Task { [weak self] in
+        await self?.superviseCapture(initialNonZeroFrameCount: baseline)
+      }
+    }
+
+    /// Rebuilds the capture chain in place.
+    private func rebuild(restartSupervision: Bool = false) -> Bool {
       lifecycle.lock()
       defer { lifecycle.unlock() }
       guard running.withLock({ $0 }) else { return false }
@@ -296,6 +311,9 @@ import os
       assembler.markSourceRestart()
       do {
         try startChainLocked()
+        if restartSupervision {
+          restartSupervisionLocked()
+        }
         return true
       } catch {
         running.withLock { $0 = false }
@@ -355,7 +373,10 @@ import os
         Self.aggregateDescription(
           aggregateUid: uid,
           tapUid: description.uuid.uuidString,
-          clockDeviceUid: clockDeviceUid
+          clockDeviceUid: clockDeviceUid,
+          clockDeviceContributesInput: clockDeviceUid.map {
+            Self.inputChannelCount(uid: $0) > 0
+          } ?? false
         ) as CFDictionary,
         &aggregate
       )
@@ -408,6 +429,7 @@ import os
         device: aggregate
       )
       deliveredSampleRate = inputFormat.sampleRate
+      deliveredInputChannels = inputFormat.channelCount
       guard
         let converter = PersistentAudioConverter(
           inputFormat: inputFormat,
@@ -492,6 +514,7 @@ import os
       }
       ioProcId = proc
       installAggregateRateListenerLocked(on: aggregateId)
+      installAggregateStreamListenerLocked(on: aggregateId)
       status = AudioDeviceStart(aggregateId, proc)
       guard status == noErr else {
         unwindLocked()
@@ -588,6 +611,7 @@ import os
 
     private func unwindLocked() {
       removeAggregateRateListenerLocked()
+      removeAggregateStreamListenerLocked()
       if let proc = ioProcId {
         AudioDeviceDestroyIOProcID(aggregateId, proc)
         ioProcId = nil
@@ -727,7 +751,81 @@ import os
           statistics: assembler.statistics()
         )
       )
-      _ = rebuild()
+      _ = rebuild(restartSupervision: true)
+    }
+
+    /// Watches the aggregate's own input stream composition.
+    private func installAggregateStreamListenerLocked(on device: AudioObjectID) {
+      removeAggregateStreamListenerLocked()
+      var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        self?.handleAggregateStreamChange()
+      }
+      let status = AudioObjectAddPropertyListenerBlock(
+        device,
+        &address,
+        deviceListenerQueue,
+        block
+      )
+      guard status == noErr else { return }
+      aggregateStreamListener = block
+      aggregateStreamListenerDevice = device
+    }
+
+    private func removeAggregateStreamListenerLocked() {
+      guard let block = aggregateStreamListener else { return }
+      var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      AudioObjectRemovePropertyListenerBlock(
+        aggregateStreamListenerDevice,
+        &address,
+        deviceListenerQueue,
+        block
+      )
+      aggregateStreamListener = nil
+      aggregateStreamListenerDevice = AudioObjectID(kAudioObjectUnknown)
+    }
+
+    /// Runs on `deviceListenerQueue` and returns immediately, mirroring
+    /// [handleAggregateRateChange]'s deadlock discipline.
+    private func handleAggregateStreamChange() {
+      guard running.withLock({ $0 }) else { return }
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        self?.rebuildForAggregateStreamChange()
+      }
+    }
+
+    private func rebuildForAggregateStreamChange() {
+      guard running.withLock({ $0 }) else { return }
+      lifecycle.lock()
+      let aggregate = aggregateId
+      let expected = deliveredInputChannels
+      lifecycle.unlock()
+      guard expected > 0, aggregate != AudioObjectID(kAudioObjectUnknown) else {
+        return
+      }
+      let present = Self.inputChannelCount(aggregate)
+      guard present != expected else { return }
+      events.emit(
+        healthEvent(
+          phase: .interrupted,
+          code: "CaptureStreamLayoutChanged",
+          message:
+            "The capture aggregate now presents \(present) input channels "
+            + "where the tap supplies \(expected); rebuilding the capture "
+            + "chain so the tap is read from the right stream.",
+          receivingAudio: false,
+          statistics: assembler.statistics()
+        )
+      )
+      _ = rebuild(restartSupervision: true)
     }
 
     /// Runs on `deviceListenerQueue` and returns immediately: teardown removes
@@ -762,7 +860,7 @@ import os
           statistics: assembler.statistics()
         )
       )
-      _ = rebuild()
+      _ = rebuild(restartSupervision: true)
     }
 
     /// Holds the process-wide App Nap assertion while this session captures.
@@ -1032,10 +1130,14 @@ import os
     ///
     /// `clockDeviceUid` anchors the aggregate to real output hardware; `nil`
     /// builds the tap-only aggregate, which has no clock source of its own.
+    /// `clockDeviceContributesInput` drops the clock device from the aggregate's
+    /// *composition* while keeping it as the clock, for a device whose own
+    /// input channels would otherwise be prepended to the tap's.
     static func aggregateDescription(
       aggregateUid: String,
       tapUid: String,
-      clockDeviceUid: String?
+      clockDeviceUid: String?,
+      clockDeviceContributesInput: Bool = false
     ) -> [String: Any] {
       var tap: [String: Any] = [kAudioSubTapUIDKey as String: tapUid]
       var description: [String: Any] = [
@@ -1052,14 +1154,30 @@ import os
       // sub-entry compensates for drift between them.
       tap[kAudioSubTapDriftCompensationKey as String] = true
       description[kAudioAggregateDeviceIsStackedKey as String] = false
-      description[kAudioAggregateDeviceMainSubDeviceKey as String] =
-        clockDeviceUid
       description[kAudioAggregateDeviceClockDeviceKey as String] =
+        clockDeviceUid
+      description[kAudioAggregateDeviceTapListKey as String] = [tap]
+      // An aggregate presents its sub-devices' input channels *before* its
+      // taps'. An output device normally has none, so the tap starts at channel
+      // zero and the IO proc can read the buffer list as the tap's format
+      // describes it. A device that does carry input channels breaks that: the
+      // buffer list arrives as its channels followed by the tap's, the read
+      // lands on the wrong stream, and every converted sample is silence while
+      // the render cycles keep advancing — a capture that looks alive and
+      // records nothing.
+      //
+      // This is not hypothetical: enabling voice processing on the microphone
+      // attaches an input side to the current *output* device (four channels on
+      // the built-in speakers), so turning the echo canceller on would silently
+      // kill the system-audio track. Such a device stays the aggregate's clock,
+      // which is all it was ever wanted for, but is kept out of the
+      // composition so the tap remains the only thing in the stream.
+      guard !clockDeviceContributesInput else { return description }
+      description[kAudioAggregateDeviceMainSubDeviceKey as String] =
         clockDeviceUid
       description[kAudioAggregateDeviceSubDeviceListKey as String] = [
         [kAudioSubDeviceUIDKey as String: clockDeviceUid]
       ]
-      description[kAudioAggregateDeviceTapListKey as String] = [tap]
       return description
     }
 
@@ -1089,6 +1207,65 @@ import os
         device != AudioDeviceID(kAudioObjectUnknown)
       else { return nil }
       return deviceUid(device)
+    }
+
+    /// Total input channels the device with `uid` presents, or 0 when it has
+    /// no input side or cannot be resolved.
+    ///
+    /// Read fresh every time an aggregate is composed: whether the current
+    /// output device has an input side is not a fixed property of the hardware.
+    /// A voice-processing unit adds one to whichever device it runs on, and
+    /// removes it again when it stops.
+    static func inputChannelCount(uid: String) -> UInt32 {
+      var translateAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      var device = AudioDeviceID(kAudioObjectUnknown)
+      var deviceSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+      var cfUid = uid as CFString
+      let translated = withUnsafeMutablePointer(to: &cfUid) { uidPointer -> OSStatus in
+        AudioObjectGetPropertyData(
+          AudioObjectID(kAudioObjectSystemObject),
+          &translateAddress,
+          UInt32(MemoryLayout<CFString>.size),
+          uidPointer,
+          &deviceSize,
+          &device
+        )
+      }
+      guard translated == noErr, device != AudioDeviceID(kAudioObjectUnknown) else {
+        return 0
+      }
+      return inputChannelCount(device)
+    }
+
+    /// Total input channels `device` presents, across every input stream.
+    static func inputChannelCount(_ device: AudioObjectID) -> UInt32 {
+      guard device != AudioObjectID(kAudioObjectUnknown) else { return 0 }
+      var streamAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      var size: UInt32 = 0
+      guard
+        AudioObjectGetPropertyDataSize(device, &streamAddress, 0, nil, &size) == noErr,
+        size > 0
+      else { return 0 }
+      let raw = UnsafeMutableRawPointer.allocate(
+        byteCount: Int(size),
+        alignment: MemoryLayout<AudioBufferList>.alignment
+      )
+      defer { raw.deallocate() }
+      guard
+        AudioObjectGetPropertyData(device, &streamAddress, 0, nil, &size, raw) == noErr
+      else { return 0 }
+      let buffers = UnsafeMutableAudioBufferListPointer(
+        raw.assumingMemoryBound(to: AudioBufferList.self)
+      )
+      return buffers.reduce(0) { $0 + $1.mNumberChannels }
     }
 
     /// Whether the HAL reports the device's IO engine as running, or nil when

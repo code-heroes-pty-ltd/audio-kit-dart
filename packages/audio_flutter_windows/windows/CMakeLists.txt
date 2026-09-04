@@ -27,6 +27,8 @@ list(APPEND PLUGIN_SOURCES
   "playback_session.h"
   "process_loopback_capture.cpp"
   "process_loopback_capture.h"
+  "voice_capture_dsp.cpp"
+  "voice_capture_dsp.h"
 )
 
 # Define the plugin library target. Its name must not be changed (see comment
@@ -69,13 +71,22 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 # Avrt        : AvSetMmThreadCharacteristics, to place the capture and render
 #               threads on the "Pro Audio" MMCSS task.
 # Propsys     : PropVariantInit / PropVariantClear for device friendly names.
+# Msdmo       : MoInitMediaType / MoFreeMediaType for the Voice Capture DSP's
+#               output media type.
+# dmoguids    : IMediaObject / IMediaBuffer interface IDs.
+# wmcodecdspuuid: CLSID_CWMAudioAEC and the MFPKEY_WMAAECMA_* property keys.
+# strmiids    : MEDIATYPE_Audio / MEDIASUBTYPE_PCM / FORMAT_WaveFormatEx.
 target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   flutter_wrapper_plugin
   Mmdevapi
   Ole32
   Avrt
-  Propsys)
+  Propsys
+  Msdmo
+  dmoguids
+  wmcodecdspuuid
+  strmiids)
 
 # List of absolute paths to libraries that should be bundled with the plugin.
 set(audio_flutter_windows_bundled_libraries

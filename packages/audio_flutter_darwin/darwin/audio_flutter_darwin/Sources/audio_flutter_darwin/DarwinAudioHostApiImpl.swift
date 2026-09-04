@@ -32,6 +32,19 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
     self.events = events
   }
 
+  /// Runs `work` off the platform thread and replies on the main thread.
+  private func offloadToBlockingQueue<Value>(
+    _ completion: @escaping (Result<Value, Error>) -> Void,
+    _ work: @escaping () -> Result<Value, Error>
+  ) {
+    blockingQueue.async {
+      let result = work()
+      DispatchQueue.main.async {
+        completion(result)
+      }
+    }
+  }
+
   private func allocateId() -> Int64 {
     lock.lock()
     defer { lock.unlock() }
@@ -65,60 +78,65 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
     completion: @escaping (Result<CaptureSessionInfoMessage, Error>) -> Void
   ) {
     let id = allocateId()
-    do {
-      let session: NativeCaptureSession
-      switch request.kind {
-      case .microphone:
-        session = try MicrophoneCaptureSession(
-          sessionId: id,
-          request: request,
-          events: events
-        )
-      case .systemAudio:
-        #if os(macOS)
-          if #available(macOS 14.4, *) {
-            session = SystemAudioCaptureSession(
-              sessionId: id,
-              request: request,
-              events: events
-            )
-          } else {
-            throw PigeonError(
-              code: "Unsupported",
-              message: "System audio capture requires macOS 14.4 or newer.",
-              details: nil
-            )
-          }
-        #else
+    offloadToBlockingQueue(completion) { [self] in
+      Result { try makeCaptureSession(id: id, request: request) }
+    }
+  }
+
+  /// Builds, registers, and announces one prepared capture session.
+  ///
+  /// Split out of `prepareCapture` so the Core Audio work it performs can run
+  /// on `blockingQueue` while the Pigeon reply stays on the main thread.
+  private func makeCaptureSession(
+    id: Int64,
+    request: CaptureRequestMessage
+  ) throws -> CaptureSessionInfoMessage {
+    let session: NativeCaptureSession
+    switch request.kind {
+    case .microphone:
+      session = try MicrophoneCaptureSession(
+        sessionId: id,
+        request: request,
+        events: events
+      )
+    case .systemAudio:
+      #if os(macOS)
+        if #available(macOS 14.4, *) {
+          session = SystemAudioCaptureSession(
+            sessionId: id,
+            request: request,
+            events: events
+          )
+        } else {
           throw PigeonError(
             code: "Unsupported",
-            message: "System audio capture is unavailable on iOS.",
+            message: "System audio capture requires macOS 14.4 or newer.",
             details: nil
           )
-        #endif
-      }
-      lock.lock()
-      captures[id] = session
-      lock.unlock()
-      let source = request.kind == .microphone ? "microphone-\(id)" : "system-\(id)"
-      let track = request.kind == .microphone ? "microphone" : "system"
-      events.emit(
-        AudioSessionEventMessage(sessionId: id, phase: .prepared)
-      )
-      completion(
-        .success(
-          CaptureSessionInfoMessage(
-            sessionId: id,
-            sourceId: source,
-            trackId: track,
-            clockId: "darwin.host-time",
-            format: request.outputFormat
-          )
+        }
+      #else
+        throw PigeonError(
+          code: "Unsupported",
+          message: "System audio capture is unavailable on iOS.",
+          details: nil
         )
-      )
-    } catch {
-      completion(.failure(error))
+      #endif
     }
+    lock.lock()
+    captures[id] = session
+    lock.unlock()
+    let source = request.kind == .microphone ? "microphone-\(id)" : "system-\(id)"
+    let track = request.kind == .microphone ? "microphone" : "system"
+    events.emit(
+      AudioSessionEventMessage(sessionId: id, phase: .prepared)
+    )
+    return CaptureSessionInfoMessage(
+      sessionId: id,
+      sourceId: source,
+      trackId: track,
+      clockId: "darwin.host-time",
+      format: request.outputFormat
+    )
   }
 
   func startCapture(
@@ -132,11 +150,8 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
     events.emit(
       AudioSessionEventMessage(sessionId: sessionId, phase: .starting)
     )
-    do {
-      try session.start()
-      completion(.success(()))
-    } catch {
-      completion(.failure(error))
+    offloadToBlockingQueue(completion) {
+      Result { try session.start() }
     }
   }
 
@@ -170,18 +185,26 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
     events.emit(
       AudioSessionEventMessage(sessionId: sessionId, phase: .stopping)
     )
-    session.stop(discardBuffered: false)
-    completion(.success(()))
+    offloadToBlockingQueue(completion) {
+      session.stop(discardBuffered: false)
+      return .success(())
+    }
   }
 
   func abortCapture(
     sessionId: Int64,
     completion: @escaping (Result<Void, Error>) -> Void
   ) {
-    capture(sessionId)?.stop(discardBuffered: true)
-    completion(.success(()))
+    let session = capture(sessionId)
+    offloadToBlockingQueue(completion) {
+      session?.stop(discardBuffered: true)
+      return .success(())
+    }
   }
 
+  /// Tearing a session down destroys its engine, tap and aggregate device, so
+  /// it runs off the platform thread like `stopCapture`; the registry entry is
+  /// removed synchronously so a later call cannot find a session being torn down.
   func disposeCapture(
     sessionId: Int64,
     completion: @escaping (Result<Void, Error>) -> Void
@@ -189,8 +212,10 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
     lock.lock()
     let session = captures.removeValue(forKey: sessionId)
     lock.unlock()
-    session?.stop(discardBuffered: true)
-    completion(.success(()))
+    offloadToBlockingQueue(completion) {
+      session?.stop(discardBuffered: true)
+      return .success(())
+    }
   }
 
   func isSystemAudioCaptureSupported(
@@ -208,13 +233,14 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
   func requestSystemAudioCapturePermission(
     completion: @escaping (Result<Bool, Error>) -> Void
   ) {
-    #if os(macOS)
-      if #available(macOS 14.4, *) {
-        completion(.success(SystemAudioCaptureSession.preflightPermission()))
-        return
-      }
-    #endif
-    completion(.success(false))
+    offloadToBlockingQueue(completion) {
+      #if os(macOS)
+        if #available(macOS 14.4, *) {
+          return .success(SystemAudioCaptureSession.preflightPermission())
+        }
+      #endif
+      return .success(false)
+    }
   }
 
   func microphonePermissionStatus(
@@ -256,15 +282,16 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
   func cleanupOrphanedAggregateDevices(
     completion: @escaping (Result<Int64, Error>) -> Void
   ) {
-    #if os(macOS)
-      if #available(macOS 14.4, *) {
-        completion(
-          .success(SystemAudioCaptureSession.cleanupOrphanedAggregateDevices())
-        )
-        return
-      }
-    #endif
-    completion(.success(0))
+    offloadToBlockingQueue(completion) {
+      #if os(macOS)
+        if #available(macOS 14.4, *) {
+          return .success(
+            SystemAudioCaptureSession.cleanupOrphanedAggregateDevices()
+          )
+        }
+      #endif
+      return .success(0)
+    }
   }
 
   func listAudioProcesses(

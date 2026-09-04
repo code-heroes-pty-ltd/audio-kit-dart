@@ -81,6 +81,7 @@ Map<String, Object?> encodeCaptureRequest(PlatformCaptureRequest request) =>
       'overflowPolicy': encodeOverflowPolicy(request.overflowPolicy),
       'processIds': request.processIds,
       'inputDeviceId': request.inputDeviceId,
+      'voiceProcessing': request.voiceProcessing,
     };
 
 Map<String, Object?> encodePlaybackRequest(PlatformPlaybackRequest request) =>

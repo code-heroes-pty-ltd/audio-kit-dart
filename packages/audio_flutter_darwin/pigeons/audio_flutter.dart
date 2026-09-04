@@ -57,6 +57,7 @@ class CaptureRequestMessage {
     this.bundleIds,
     this.inputDeviceId,
     this.rawRecordingPath,
+    this.voiceProcessing,
   });
 
   CaptureKindMessage kind;
@@ -75,6 +76,13 @@ class CaptureRequestMessage {
   List<String>? bundleIds;
   String? inputDeviceId;
   String? rawRecordingPath;
+
+  /// Whether to run the microphone through the platform voice-processing unit,
+  /// whose echo canceller removes the system output from the captured signal.
+  ///
+  /// Null and false are the same request: the raw input tap. Ignored by
+  /// system-audio capture.
+  bool? voiceProcessing;
 }
 
 class CaptureSessionInfoMessage {

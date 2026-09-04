@@ -74,6 +74,21 @@ final class PersistentAudioConverter {
     outputFormat = output
     self.inputFormat = inputFormat
     self.converter = converter
+    Self.mapUnmappedOutputChannels(of: converter, inputFormat: inputFormat)
+  }
+
+  /// Points output channels the converter left unmapped at real input channels.
+  private static func mapUnmappedOutputChannels(
+    of converter: AVAudioConverter,
+    inputFormat: AVAudioFormat
+  ) {
+    let inputChannels = Int(inputFormat.channelCount)
+    guard inputChannels > 0 else { return }
+    let map = converter.channelMap
+    guard map.contains(where: { $0.intValue < 0 }) else { return }
+    converter.channelMap = (0..<map.count).map { channel in
+      NSNumber(value: min(channel, inputChannels - 1))
+    }
   }
 
   /// Converts to owned interleaved float32 samples.

@@ -384,6 +384,34 @@ void main() {
     await session.close();
   });
 
+  test('the platform echo canceller is opt-in per capture', () async {
+    final _FakeAudioPlatform platform = _FakeAudioPlatform(captureInfo);
+    addTearDown(platform.close);
+
+    final AudioSourceSession raw = await FlutterAudioCaptureSource(
+      FlutterAudioCaptureConfig(
+        type: AudioCaptureType.microphone,
+        format: format,
+      ),
+      platform: platform,
+    ).prepare();
+    // A capture that did not ask for it must reach the platform unprocessed:
+    // enabling cancellation changes the recorded signal.
+    expect(platform.lastCaptureRequest?.voiceProcessing, isFalse);
+    await raw.close();
+
+    final AudioSourceSession cancelled = await FlutterAudioCaptureSource(
+      FlutterAudioCaptureConfig(
+        type: AudioCaptureType.microphone,
+        format: format,
+        voiceProcessing: true,
+      ),
+      platform: platform,
+    ).prepare();
+    expect(platform.lastCaptureRequest?.voiceProcessing, isTrue);
+    await cancelled.close();
+  });
+
   test('system capture forwards both process and bundle selections', () async {
     final _FakeAudioPlatform platform = _FakeAudioPlatform(captureInfo);
     addTearDown(platform.close);

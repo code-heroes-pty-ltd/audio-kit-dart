@@ -23,6 +23,7 @@
 #include "audio_format.h"
 #include "com_utils.h"
 #include "process_loopback_capture.h"
+#include "voice_capture_dsp.h"
 
 namespace audio_flutter_windows {
 
@@ -44,6 +45,54 @@ int64_t NowMillis() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+// Puts a capture stream in the category Windows reserves for calls.
+bool ApplyCommunicationsCategory(IAudioClient* client) {
+  ComPtr<IAudioClient2> client2;
+  if (FAILED(client->QueryInterface(IID_PPV_ARGS(client2.put()))) || !client2) {
+    return false;
+  }
+  AudioClientProperties properties = {};
+  properties.cbSize = sizeof(AudioClientProperties);
+  properties.bIsOffload = FALSE;
+  properties.eCategory = AudioCategory_Communications;
+  properties.Options = AUDCLNT_STREAMOPTIONS_NONE;
+  return SUCCEEDED(client2->SetClientProperties(&properties));
+}
+
+// Whether the endpoint itself cancels echo, so far as Windows will say.
+bool EndpointCancelsEcho(IMMDevice* device) {
+#ifdef __IAudioEffectsManager_INTERFACE_DEFINED__
+  ComPtr<IAudioEffectsManager> effects_manager;
+  if (FAILED(device->Activate(__uuidof(IAudioEffectsManager), CLSCTX_ALL,
+                              nullptr,
+                              reinterpret_cast<void**>(
+                                  effects_manager.put()))) ||
+      !effects_manager) {
+    return false;
+  }
+  AUDIO_EFFECT* effects = nullptr;
+  UINT32 effect_count = 0;
+  if (FAILED(effects_manager->GetAudioEffects(&effects, &effect_count)) ||
+      effects == nullptr) {
+    return false;
+  }
+  bool cancels = false;
+  for (UINT32 index = 0; index < effect_count; ++index) {
+    if (effects[index].id ==
+            AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION &&
+        effects[index].state == AUDIO_EFFECT_STATE_ON) {
+      cancels = true;
+      break;
+    }
+  }
+  ::CoTaskMemFree(effects);
+  return cancels;
+#else
+  (void)device;
+  return false;
+#endif
 }
 
 int64_t QpcNowMicros() {
@@ -314,12 +363,32 @@ void CaptureSession::CaptureThreadMain() {
     return;
   }
 
+  // A DSP that could not be created has already reported itself and handed the
+  // capture back here; the endpoint stream is what is left, so the handover is
+  // not offered a second time.
+  const bool echo_cancelled = config_.kind == CaptureKind::kMicrophone &&
+                              config_.voice_processing &&
+                              !echo_cancellation_declined_.load();
+  if (echo_cancelled && !EndpointCancelsEcho(device.get())) {
+    // Nothing on the endpoint will remove the speakers from this microphone,
+    // so the capture is handed to the DSP that will.
+    EchoCancelledCaptureThreadMain();
+    return;
+  }
+
   ComPtr<IAudioClient> audio_client;
   hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                         reinterpret_cast<void**>(audio_client.put()));
   if (FAILED(hr)) {
     Fail("CaptureFailed", "IAudioClient activation failed");
     running_.store(false);
+    return;
+  }
+
+  if (echo_cancelled && !ApplyCommunicationsCategory(audio_client.get())) {
+    // The endpoint reported a canceller a moment ago but will not take the
+    // category that runs it, so the stream would be raw after all.
+    EchoCancelledCaptureThreadMain();
     return;
   }
 
@@ -660,6 +729,136 @@ void CaptureSession::ProcessCaptureThreadMain() {
   }
 
   capture.Stop();
+  running_.store(false);
+  if (overflowed) {
+    Fail("CaptureMailboxOverflow",
+         "the capture mailbox overflowed under the failCapture policy");
+    return;
+  }
+  finished_.store(true);
+  frames_available_.notify_all();
+}
+
+void CaptureSession::EchoCancelledCaptureThreadMain() {
+  ComApartment apartment;
+  if (!apartment.ok()) {
+    Fail("CaptureFailed", "COM could not be initialised on the capture thread");
+    running_.store(false);
+    return;
+  }
+
+  VoiceCaptureDsp dsp(config_.endpoint_id);
+  std::string error;
+  if (!dsp.Initialize(&error)) {
+    // The canceller is a quality of the capture, not the capture itself, and
+    // the caller asked for a microphone. Report why the far end will still be
+    // on this track and carry on with the plain endpoint stream.
+    Emit(SessionPhase::kInterrupted, "MicrophoneVoiceProcessingUnavailable",
+         "Echo cancellation is unavailable for this microphone, so audio "
+         "played through the speakers is recorded on this track too: " +
+             error);
+    echo_cancellation_declined_.store(true);
+    CaptureThreadMain();
+    return;
+  }
+
+  DWORD mmcss_task_index = 0;
+  MmcssHandle mmcss(::AvSetMmThreadCharacteristicsW(L"Pro Audio",
+                                                    &mmcss_task_index));
+  Emit(SessionPhase::kRunning);
+
+  LinearResampler resampler;
+  resampler.Reset(static_cast<double>(kVoiceCaptureDspSampleRate),
+                  static_cast<double>(config_.sample_rate));
+
+  const auto channel_count =
+      static_cast<size_t>(std::max(1, config_.channel_count));
+  const int64_t frame_micros =
+      config_.frame_duration_micros > 0 ? config_.frame_duration_micros : 100000;
+  const auto samples_per_frame = static_cast<size_t>(std::max<int64_t>(
+      1, static_cast<int64_t>(config_.sample_rate) * frame_micros / 1000000));
+
+  std::vector<float> cancelled;
+  std::vector<float> resampled;
+  std::vector<float> pending;
+  const int64_t started_at = NowMillis();
+  int64_t timestamp_anchor_micros = -1;
+  bool overflowed = false;
+
+  while (!stop_requested_.load()) {
+    cancelled.clear();
+    if (!dsp.Drain(&cancelled, &error)) {
+      dsp.Stop();
+      running_.store(false);
+      Fail("CaptureFailed", error);
+      return;
+    }
+    if (!cancelled.empty()) {
+      if (timestamp_anchor_micros < 0) {
+        // The DSP reports its own stream time, which starts at zero and says
+        // nothing about the session clock; anchoring on the first delivery is
+        // the same mapping the other poll-driven paths use.
+        timestamp_anchor_micros = QpcNowMicros();
+      }
+      resampled.clear();
+      resampler.Process(cancelled, &resampled);
+      pending.insert(pending.end(), resampled.begin(), resampled.end());
+      received_any_audio_.store(true);
+    }
+
+    while (pending.size() >= samples_per_frame) {
+      CapturedFrame frame;
+      frame.samples.resize(samples_per_frame * channel_count);
+      for (size_t index = 0; index < samples_per_frame; ++index) {
+        // The DSP is mono; a wider request is satisfied by replication, as on
+        // every other capture path here.
+        for (size_t channel = 0; channel < channel_count; ++channel) {
+          frame.samples[index * channel_count + channel] = pending[index];
+        }
+      }
+      pending.erase(
+          pending.begin(),
+          pending.begin() + static_cast<std::ptrdiff_t>(samples_per_frame));
+
+      FrameRing::Admission admission;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        frame.sequence = next_sequence_++;
+        frame.sample_offset = next_sample_offset_;
+        frame.timestamp_micros =
+            std::max<int64_t>(0, timestamp_anchor_micros) +
+            next_sample_offset_ * 1000000 / std::max(1, config_.sample_rate);
+        next_sample_offset_ += static_cast<int64_t>(samples_per_frame);
+        admission = ring_.Add(std::move(frame));
+      }
+      if (admission == FrameRing::Admission::kOverflowed) {
+        overflowed = true;
+        break;
+      }
+      frames_available_.notify_all();
+    }
+
+    if (overflowed) {
+      break;
+    }
+    if (!received_any_audio_.load() &&
+        NowMillis() - started_at > kStallTimeoutMillis) {
+      dsp.Stop();
+      running_.store(false);
+      Fail("CaptureStalled",
+           "no echo-cancelled audio delivered within the capture stall "
+           "timeout");
+      return;
+    }
+
+    // The DSP produces 10 ms at a time; polling on that cadence keeps latency
+    // at one block without spinning.
+    for (DWORD slept = 0; slept < 10 && !stop_requested_.load(); slept += 5) {
+      ::Sleep(5);
+    }
+  }
+
+  dsp.Stop();
   running_.store(false);
   if (overflowed) {
     Fail("CaptureMailboxOverflow",

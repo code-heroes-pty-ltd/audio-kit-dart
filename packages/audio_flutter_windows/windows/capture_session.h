@@ -54,6 +54,9 @@ struct CaptureConfig {
   OverflowPolicy overflow_policy = OverflowPolicy::kFailCapture;
   // Empty selects the default endpoint for `kind`.
   std::string endpoint_id;
+  // Whether a microphone capture is echo-cancelled against the system output.
+  // Ignored for system-audio capture, which is the reference signal itself.
+  bool voice_processing = false;
   // Exact requested process trees. Empty selects endpoint capture.
   std::vector<DWORD> process_ids;
 };
@@ -103,6 +106,7 @@ class CaptureSession {
  private:
   void CaptureThreadMain();
   void ProcessCaptureThreadMain();
+  void EchoCancelledCaptureThreadMain();
   void JoinThread();
   void Emit(SessionPhase phase, const std::string& code = std::string(),
             const std::string& message = std::string());
@@ -119,6 +123,9 @@ class CaptureSession {
   std::atomic<bool> running_{false};
   std::atomic<bool> finished_{false};
   std::atomic<bool> received_any_audio_{false};
+  // Set once the Voice Capture DSP has refused a session, so the plain endpoint
+  // stream it falls back to cannot hand the capture to the DSP again.
+  std::atomic<bool> echo_cancellation_declined_{false};
 
   mutable std::mutex mutex_;
   std::condition_variable frames_available_;

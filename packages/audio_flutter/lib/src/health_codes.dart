@@ -59,6 +59,20 @@ abstract final class AudioCaptureHealthCodes {
   /// [captureSampleRateChanged]. Non-fatal.
   static const systemRecordingFormatChanged = 'SystemRecordingFormatChanged';
 
+  /// The capture asked for the platform echo canceller and the platform
+  /// refused it, so audio played through the speakers is on this track as
+  /// well as on the system-audio one. Reported once, as the session starts.
+  /// Non-fatal.
+  static const microphoneVoiceProcessingUnavailable =
+      'MicrophoneVoiceProcessingUnavailable';
+
+  /// The capture aggregate began presenting input channels the tap does not
+  /// supply, so the tap was no longer the stream being read; the chain was
+  /// rebuilt against the new layout. Emitted when a device the aggregate holds
+  /// grows an input side mid-capture — enabling the platform echo canceller
+  /// does exactly that to whichever output device it runs on. Non-fatal.
+  static const captureStreamLayoutChanged = 'CaptureStreamLayoutChanged';
+
   /// Every constant in this contract, for exhaustive tooling and tests.
   static const all = <String>[
     systemCaptureAwaitingAppAudio,
@@ -72,5 +86,7 @@ abstract final class AudioCaptureHealthCodes {
     microphoneCaptureDead,
     microphoneRecordingFormatChanged,
     systemRecordingFormatChanged,
+    microphoneVoiceProcessingUnavailable,
+    captureStreamLayoutChanged,
   ];
 }

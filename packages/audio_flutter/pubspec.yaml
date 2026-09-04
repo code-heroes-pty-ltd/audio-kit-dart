@@ -36,8 +36,6 @@ dev_dependencies:
 flutter:
   plugin:
     platforms:
-      ios:
-        default_package: audio_flutter_darwin
       linux:
         default_package: audio_flutter_linux
       macos:

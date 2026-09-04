@@ -3,13 +3,9 @@ import AudioFlutterDarwinCore
 import Foundation
 import os
 
-#if os(iOS)
-  import Flutter
-#elseif os(macOS)
-  import AudioToolbox
-  import CoreAudio
-  import FlutterMacOS
-#endif
+import AudioToolbox
+import CoreAudio
+import FlutterMacOS
 
 final class MicrophoneCaptureSession: NativeCaptureSession {
   let sessionId: Int64
@@ -94,31 +90,15 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     )
     mailbox = FrameMailbox(capacity: capacity, overflowPolicy: request.overflowPolicy)
 
-    #if os(macOS)
-      if let uid = request.inputDeviceId, !uid.isEmpty,
-        !AudioInputDeviceSelection.apply(uid: uid, to: engine)
-      {
-        throw PigeonError(
-          code: "InputDeviceUnavailable",
-          message: "The selected audio input device is unavailable.",
-          details: nil
-        )
-      }
-    #elseif os(iOS)
-      if let uid = request.inputDeviceId, !uid.isEmpty {
-        let session = AVAudioSession.sharedInstance()
-        guard
-          let input = session.availableInputs?.first(where: { $0.uid == uid })
-        else {
-          throw PigeonError(
-            code: "InputDeviceUnavailable",
-            message: "The selected audio input device is unavailable.",
-            details: nil
-          )
-        }
-        try session.setPreferredInput(input)
-      }
-    #endif
+    if let uid = request.inputDeviceId, !uid.isEmpty,
+      !AudioInputDeviceSelection.apply(uid: uid, to: engine)
+    {
+      throw PigeonError(
+        code: "InputDeviceUnavailable",
+        message: "The selected audio input device is unavailable.",
+        details: nil
+      )
+    }
     // Before the format is read: the voice-processing unit presents its own
     // format, so a read taken ahead of this describes the raw input node that
     // is about to be replaced.
@@ -156,15 +136,6 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     lifecycle.lock()
     defer { lifecycle.unlock() }
     guard !running.withLock({ $0 }) else { return }
-    #if os(iOS)
-      let audioSession = AVAudioSession.sharedInstance()
-      try audioSession.setCategory(
-        .playAndRecord,
-        mode: .default,
-        options: [.defaultToSpeaker, .allowBluetoothHFP]
-      )
-      try audioSession.setActive(true)
-    #endif
 
     let input = engine.inputNode
     // Selecting the input device during prepare (and a Bluetooth HFP
@@ -219,12 +190,6 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
       workRing.finish(discardBuffered: true)
       workerQueue.sync {}
       mailbox.finish(discardBuffered: true)
-      #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(
-          false,
-          options: .notifyOthersOnDeactivation
-        )
-      #endif
       throw error
     }
     setActivityHold(true)
@@ -737,14 +702,6 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     setActivityHold(false)
     let failed = failureScheduled.withLock { $0 }
     mailbox.finish(discardBuffered: discardBuffered || failed)
-    #if os(iOS)
-      if wasRunning {
-        try? AVAudioSession.sharedInstance().setActive(
-          false,
-          options: .notifyOthersOnDeactivation
-        )
-      }
-    #endif
     lifecycle.unlock()
     if wasRunning, !discardBuffered, !failed {
       emitTrailingDropHealth()
@@ -1085,20 +1042,6 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
 
 enum AudioInputDevices {
   static func list() -> [AudioInputDeviceMessage] {
-    #if os(macOS)
-      return AudioInputDeviceSelection.listDevices()
-    #elseif os(iOS)
-      let session = AVAudioSession.sharedInstance()
-      let inputs = session.availableInputs ?? []
-      let selectedUid =
-        session.preferredInput?.uid ?? session.currentRoute.inputs.first?.uid
-      return inputs.map { input in
-        AudioInputDeviceMessage(
-          id: input.uid,
-          label: input.portName,
-          isDefault: input.uid == selectedUid
-        )
-      }
-    #endif
+    AudioInputDeviceSelection.listDevices()
   }
 }

@@ -1,11 +1,7 @@
 import AVFoundation
 import Foundation
 
-#if os(iOS)
-  import Flutter
-#elseif os(macOS)
-  import FlutterMacOS
-#endif
+import FlutterMacOS
 
 protocol NativeCaptureSession: AnyObject {
   var sessionId: Int64 { get }
@@ -100,27 +96,19 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
         events: events
       )
     case .systemAudio:
-      #if os(macOS)
-        if #available(macOS 14.4, *) {
-          session = SystemAudioCaptureSession(
-            sessionId: id,
-            request: request,
-            events: events
-          )
-        } else {
-          throw PigeonError(
-            code: "Unsupported",
-            message: "System audio capture requires macOS 14.4 or newer.",
-            details: nil
-          )
-        }
-      #else
+      if #available(macOS 14.4, *) {
+        session = SystemAudioCaptureSession(
+          sessionId: id,
+          request: request,
+          events: events
+        )
+      } else {
         throw PigeonError(
           code: "Unsupported",
-          message: "System audio capture is unavailable on iOS.",
+          message: "System audio capture requires macOS 14.4 or newer.",
           details: nil
         )
-      #endif
+      }
     }
     lock.lock()
     captures[id] = session
@@ -221,12 +209,10 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
   func isSystemAudioCaptureSupported(
     completion: @escaping (Result<Bool, Error>) -> Void
   ) {
-    #if os(macOS)
-      if #available(macOS 14.4, *) {
-        completion(.success(true))
-        return
-      }
-    #endif
+    if #available(macOS 14.4, *) {
+      completion(.success(true))
+      return
+    }
     completion(.success(false))
   }
 
@@ -234,11 +220,9 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
     completion: @escaping (Result<Bool, Error>) -> Void
   ) {
     offloadToBlockingQueue(completion) {
-      #if os(macOS)
-        if #available(macOS 14.4, *) {
-          return .success(SystemAudioCaptureSession.preflightPermission())
-        }
-      #endif
+      if #available(macOS 14.4, *) {
+        return .success(SystemAudioCaptureSession.preflightPermission())
+      }
       return .success(false)
     }
   }
@@ -283,13 +267,11 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
     completion: @escaping (Result<Int64, Error>) -> Void
   ) {
     offloadToBlockingQueue(completion) {
-      #if os(macOS)
-        if #available(macOS 14.4, *) {
-          return .success(
-            SystemAudioCaptureSession.cleanupOrphanedAggregateDevices()
-          )
-        }
-      #endif
+      if #available(macOS 14.4, *) {
+        return .success(
+          SystemAudioCaptureSession.cleanupOrphanedAggregateDevices()
+        )
+      }
       return .success(0)
     }
   }
@@ -297,12 +279,10 @@ final class DarwinAudioHostApiImpl: DarwinAudioHostApi {
   func listAudioProcesses(
     completion: @escaping (Result<[AudioProcessMessage], Error>) -> Void
   ) {
-    #if os(macOS)
-      if #available(macOS 14.4, *) {
-        completion(.success(SystemAudioCaptureSession.listProcesses()))
-        return
-      }
-    #endif
+    if #available(macOS 14.4, *) {
+      completion(.success(SystemAudioCaptureSession.listProcesses()))
+      return
+    }
     completion(.success([]))
   }
 

@@ -2,11 +2,7 @@ import AVFoundation
 import Foundation
 import os
 
-#if os(iOS)
-  import Flutter
-#elseif os(macOS)
-  import FlutterMacOS
-#endif
+import FlutterMacOS
 
 enum MonotonicClock {
   static func microseconds(hostTime: UInt64? = nil) -> Int64 {

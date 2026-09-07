@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <system_error>
 #include <utility>
 
@@ -159,6 +160,38 @@ std::wstring DefaultEndpointId(IMMDeviceEnumerator* enumerator, EDataFlow flow,
     return std::wstring();
   }
   return std::wstring(id.get());
+}
+
+// How far a packet's own timestamp may sit from where the running timeline
+// expects it before the timeline is re-anchored to the device clock. Comfortably
+// above ordinary packet jitter and far below the gap a device change leaves.
+constexpr int64_t kTimelineResyncToleranceMicros = 20000;
+
+// Re-anchors `pending_start_micros` — the capture time of the sample at the head
+// of `pending` — whenever the incoming audio is not contiguous with it.
+//
+// Deriving every timestamp from a single anchor plus a count of emitted samples
+// measures samples, not time: audio that was never captured is never counted, so
+// an interruption silently vanishes from the timeline and every later frame is
+// stamped as though it had not happened. The host can only materialise a gap its
+// frames actually express. Anchoring each run of audio to the timestamp the
+// device reported for it keeps the timeline measured, so a device change becomes
+// a gap the host pads rather than a permanent offset between the tracks.
+void ResyncTimeline(int64_t packet_micros, size_t pending_samples,
+                    int sample_rate, int64_t* pending_start_micros) {
+  const int64_t rate = std::max(1, sample_rate);
+  const int64_t buffered_micros =
+      static_cast<int64_t>(pending_samples) * 1000000 / rate;
+  // Where the running timeline says this packet's first sample belongs.
+  const int64_t expected_micros = *pending_start_micros + buffered_micros;
+  if (pending_samples != 0 &&
+      std::llabs(packet_micros - expected_micros) <=
+          kTimelineResyncToleranceMicros) {
+    return;
+  }
+  // The samples already buffered belong immediately before this packet, so the
+  // head keeps its position relative to audio that is known to be contiguous.
+  *pending_start_micros = packet_micros - buffered_micros;
 }
 
 int64_t QpcNowMicros() {
@@ -433,12 +466,12 @@ void CaptureSession::CaptureThreadMain() {
       config_.endpoint_id.empty() ? enumerator.get() : nullptr, &notifier);
   default_endpoint_changed_.store(false);
 
-  // State that outlives one endpoint stream. The anchor is set once, from the
-  // first packet of the session, and never again: sample offsets keep counting
-  // across a rebuild, so re-anchoring would move every later frame. The gap a
-  // rebuild leaves is the host's to materialise, which it already does.
+  // State that outlives one endpoint stream. `pending_start_micros` is the
+  // capture time of the sample at the head of `pending`, re-anchored from each
+  // packet's own device timestamp, so a rebuild's gap lands in the timeline
+  // instead of disappearing from it.
   std::vector<float> pending;
-  int64_t timestamp_anchor_micros = -1;
+  int64_t pending_start_micros = 0;
   bool running_emitted = false;
   bool idle_reported = false;
   int rebuilds = 0;
@@ -621,15 +654,19 @@ void CaptureSession::CaptureThreadMain() {
           break;
         }
 
-        if (timestamp_anchor_micros < 0 && frames_available > 0) {
-          timestamp_anchor_micros =
+        if (!mono_block.empty()) {
+          // `qpc_position` is the device's own timestamp for the first sample
+          // of this packet. Read on every packet, not just the first: it is
+          // what makes the timeline measured rather than counted.
+          const int64_t packet_micros =
               (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0 &&
                       qpc_position != 0
                   ? static_cast<int64_t>(qpc_position / 10)
-                  : QpcNowMicros();
-        }
-
-        if (!mono_block.empty()) {
+                  : QpcNowMicros() - static_cast<int64_t>(frames_available) *
+                                         1000000 /
+                                         std::max<DWORD>(1, source_rate);
+          ResyncTimeline(packet_micros, pending.size(), config_.sample_rate,
+                         &pending_start_micros);
           resampled.clear();
           resampler.Process(mono_block, &resampled);
           pending.insert(pending.end(), resampled.begin(), resampled.end());
@@ -659,11 +696,11 @@ void CaptureSession::CaptureThreadMain() {
             std::lock_guard<std::mutex> lock(mutex_);
             frame.sequence = next_sequence_++;
             frame.sample_offset = next_sample_offset_;
-            frame.timestamp_micros =
-                std::max<int64_t>(0, timestamp_anchor_micros) +
-                next_sample_offset_ * 1000000 /
-                    std::max(1, config_.sample_rate);
+            frame.timestamp_micros = std::max<int64_t>(0, pending_start_micros);
             next_sample_offset_ += static_cast<int64_t>(samples_per_frame);
+            pending_start_micros +=
+                static_cast<int64_t>(samples_per_frame) * 1000000 /
+                std::max(1, config_.sample_rate);
             admission = ring_.Add(std::move(frame));
           }
           if (admission == FrameRing::Admission::kOverflowed) {
@@ -926,7 +963,7 @@ void CaptureSession::EchoCancelledCaptureThreadMain() {
   std::vector<float> resampled;
   std::vector<float> pending;
   const int64_t started_at = NowMillis();
-  int64_t timestamp_anchor_micros = -1;
+  int64_t pending_start_micros = 0;
   bool overflowed = false;
 
   while (!stop_requested_.load()) {
@@ -943,12 +980,17 @@ void CaptureSession::EchoCancelledCaptureThreadMain() {
       return;
     }
     if (!cancelled.empty()) {
-      if (timestamp_anchor_micros < 0) {
-        // The DSP reports its own stream time, which starts at zero and says
-        // nothing about the session clock; anchoring on the first delivery is
-        // the same mapping the other poll-driven paths use.
-        timestamp_anchor_micros = QpcNowMicros();
-      }
+      // The DSP reports its own stream time, which starts at zero and says
+      // nothing about the session clock, and it hands over whole blocks rather
+      // than timestamped packets. The closest thing to a capture time is the
+      // moment the block finished arriving, less the audio it contains — read
+      // on every drain, so a stall re-anchors instead of shifting every later
+      // frame. It is later than the true capture instant by the DSP's own
+      // latency, which is a constant offset rather than a growing one.
+      const int64_t block_micros = static_cast<int64_t>(cancelled.size()) *
+                                   1000000 / kVoiceCaptureDspSampleRate;
+      ResyncTimeline(QpcNowMicros() - block_micros, pending.size(),
+                     config_.sample_rate, &pending_start_micros);
       resampled.clear();
       resampler.Process(cancelled, &resampled);
       pending.insert(pending.end(), resampled.begin(), resampled.end());
@@ -974,10 +1016,10 @@ void CaptureSession::EchoCancelledCaptureThreadMain() {
         std::lock_guard<std::mutex> lock(mutex_);
         frame.sequence = next_sequence_++;
         frame.sample_offset = next_sample_offset_;
-        frame.timestamp_micros =
-            std::max<int64_t>(0, timestamp_anchor_micros) +
-            next_sample_offset_ * 1000000 / std::max(1, config_.sample_rate);
+        frame.timestamp_micros = std::max<int64_t>(0, pending_start_micros);
         next_sample_offset_ += static_cast<int64_t>(samples_per_frame);
+        pending_start_micros += static_cast<int64_t>(samples_per_frame) *
+                                1000000 / std::max(1, config_.sample_rate);
         admission = ring_.Add(std::move(frame));
       }
       if (admission == FrameRing::Admission::kOverflowed) {

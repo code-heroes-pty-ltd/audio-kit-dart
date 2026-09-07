@@ -16,6 +16,16 @@ struct CapturedFrame {
   int64_t sample_offset = 0;
   int64_t timestamp_micros = 0;
   int64_t dropped_frames_before = 0;
+  // Set on the first frame after the capture timeline moved: a source that
+  // stopped producing, or a chain rebuilt against another endpoint.
+  //
+  // A host places frames by counting samples from an anchor, and only re-reads
+  // the timestamp when a frame says the timeline restarted. Without this, audio
+  // the source never produced is audio the host never accounts for: its
+  // position lags real time by the length of the gap, permanently, until it
+  // falls behind what has already been written and every later frame is
+  // discarded. Nothing was dropped, so `dropped_frames_before` cannot say it.
+  bool timeline_restarted = false;
   std::vector<float> samples;
 };
 

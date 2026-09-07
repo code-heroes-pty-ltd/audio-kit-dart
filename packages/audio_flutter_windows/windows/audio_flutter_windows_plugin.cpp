@@ -140,6 +140,12 @@ flutter::EncodableValue FrameToValue(int64_t session_id,
       flutter::EncodableValue(frame.timestamp_micros);
   map[flutter::EncodableValue("droppedFramesBefore")] =
       flutter::EncodableValue(frame.dropped_frames_before);
+  if (frame.timeline_restarted) {
+    // The host places frames by counting samples from an anchor and only
+    // re-reads a frame's timestamp when it is told the timeline restarted.
+    map[flutter::EncodableValue("discontinuityReason")] =
+        flutter::EncodableValue("sourceRestart");
+  }
   map[flutter::EncodableValue("samples")] =
       flutter::EncodableValue(std::move(payload));
   return flutter::EncodableValue(std::move(map));

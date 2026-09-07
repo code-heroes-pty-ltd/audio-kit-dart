@@ -55,6 +55,23 @@ String encodeOverflowPolicy(PlatformCaptureOverflowPolicy policy) =>
       PlatformCaptureOverflowPolicy.failCapture => 'failCapture',
     };
 
+/// Maps a wire discontinuity name onto the contract enum.
+///
+/// Null means the frame continues the one before it, which is the ordinary
+/// case; an unknown name is still a break in the timeline, so it degrades to
+/// [PlatformAudioDiscontinuityReason.unknown] rather than being discarded. A
+/// dropped break is worse than an imprecise one: a host that never learns the
+/// timeline moved keeps placing audio where the old timeline said it belonged.
+PlatformAudioDiscontinuityReason? decodeDiscontinuityReason(String? name) =>
+    switch (name) {
+      null => null,
+      'droppedFrames' => PlatformAudioDiscontinuityReason.droppedFrames,
+      'sourceRestart' => PlatformAudioDiscontinuityReason.sourceRestart,
+      'clockReset' => PlatformAudioDiscontinuityReason.clockReset,
+      'formatChange' => PlatformAudioDiscontinuityReason.formatChange,
+      _ => PlatformAudioDiscontinuityReason.unknown,
+    };
+
 /// Maps a wire phase name onto the contract enum.
 ///
 /// Unknown names degrade to [PlatformAudioSessionPhase.failed] rather than
@@ -132,6 +149,9 @@ PlatformAudioFrame decodeFrame(Map<Object?, Object?> entry) {
     timestamp: Duration(microseconds: _requireInt(entry, 'timestampMicros')),
     samples: decodeFloat32Le(samples),
     droppedFramesBefore: _optionalInt(entry, 'droppedFramesBefore') ?? 0,
+    discontinuityReason: decodeDiscontinuityReason(
+      entry['discontinuityReason'] as String?,
+    ),
   );
 }
 

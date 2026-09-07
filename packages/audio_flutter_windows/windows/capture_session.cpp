@@ -172,6 +172,9 @@ constexpr int64_t kTimelineResyncToleranceMicros = 20000;
 // tight enough to catch a device reporting a stream-relative position.
 constexpr int64_t kTimelineTrustWindowMicros = 5000000;
 
+// A timeline that has not seen its first audio yet.
+constexpr int64_t kTimelineUnset = INT64_MIN;
+
 // Re-anchors `pending_start_micros` — the capture time of the sample at the head
 // of `pending` — whenever the incoming audio is not contiguous with it.
 //
@@ -182,18 +185,23 @@ constexpr int64_t kTimelineTrustWindowMicros = 5000000;
 // frames actually express. Anchoring each run of audio to the timestamp the
 // device reported for it keeps the timeline measured, so a device change becomes
 // a gap the host pads rather than a permanent offset between the tracks.
-void ResyncTimeline(int64_t packet_micros, size_t pending_samples,
+bool ResyncTimeline(int64_t packet_micros, size_t pending_samples,
                     int sample_rate, int64_t emitted_through_micros,
                     int64_t* pending_start_micros) {
   const int64_t rate = std::max(1, sample_rate);
   const int64_t buffered_micros =
       static_cast<int64_t>(pending_samples) * 1000000 / rate;
-  // Where the running timeline says this packet's first sample belongs.
+  if (*pending_start_micros == kTimelineUnset) {
+    // The session's first audio. Establishing the timeline is not a break in it.
+    *pending_start_micros = packet_micros - buffered_micros;
+    return false;
+  }
+  // Where the running timeline says this packet's first sample belongs. Valid
+  // with nothing buffered too: the head is then simply the next sample due.
   const int64_t expected_micros = *pending_start_micros + buffered_micros;
-  if (pending_samples != 0 &&
-      std::llabs(packet_micros - expected_micros) <=
-          kTimelineResyncToleranceMicros) {
-    return;
+  if (std::llabs(packet_micros - expected_micros) <=
+      kTimelineResyncToleranceMicros) {
+    return false;
   }
   // The samples already buffered belong immediately before this packet, so the
   // head keeps its position relative to audio that is known to be contiguous.
@@ -208,6 +216,7 @@ void ResyncTimeline(int64_t packet_micros, size_t pending_samples,
     resynced = emitted_through_micros;
   }
   *pending_start_micros = resynced;
+  return true;
 }
 
 int64_t QpcNowMicros() {
@@ -487,10 +496,13 @@ void CaptureSession::CaptureThreadMain() {
   // packet's own device timestamp, so a rebuild's gap lands in the timeline
   // instead of disappearing from it.
   std::vector<float> pending;
-  int64_t pending_start_micros = 0;
+  int64_t pending_start_micros = kTimelineUnset;
   // End of the most recent frame handed to the ring; the timeline never steps
   // back before it.
   int64_t emitted_through_micros = 0;
+  // Raised when the timeline moved, lowered by the frame that reports it, so
+  // the host re-anchors once rather than on every frame that follows.
+  bool timeline_restarted = false;
   bool running_emitted = false;
   bool idle_reported = false;
   int rebuilds = 0;
@@ -697,8 +709,10 @@ void CaptureSession::CaptureThreadMain() {
                   kTimelineTrustWindowMicros;
           const int64_t packet_micros =
               usable ? reported_micros : now_micros - packet_duration_micros;
-          ResyncTimeline(packet_micros, pending.size(), config_.sample_rate,
-                         emitted_through_micros, &pending_start_micros);
+          if (ResyncTimeline(packet_micros, pending.size(), config_.sample_rate,
+                             emitted_through_micros, &pending_start_micros)) {
+            timeline_restarted = true;
+          }
           resampled.clear();
           resampler.Process(mono_block, &resampled);
           pending.insert(pending.end(), resampled.begin(), resampled.end());
@@ -729,6 +743,8 @@ void CaptureSession::CaptureThreadMain() {
             frame.sequence = next_sequence_++;
             frame.sample_offset = next_sample_offset_;
             frame.timestamp_micros = std::max<int64_t>(0, pending_start_micros);
+            frame.timeline_restarted = timeline_restarted;
+            timeline_restarted = false;
             next_sample_offset_ += static_cast<int64_t>(samples_per_frame);
             pending_start_micros +=
                 static_cast<int64_t>(samples_per_frame) * 1000000 /
@@ -884,7 +900,9 @@ void CaptureSession::ProcessCaptureThreadMain() {
 
   std::vector<float> mixed;
   std::vector<float> pending;
-  int64_t pending_timestamp_micros = 0;
+  int64_t pending_timestamp_micros = kTimelineUnset;
+  int64_t emitted_through_micros = 0;
+  bool timeline_restarted = false;
   const int64_t started_at = NowMillis();
   bool overflowed = false;
 
@@ -897,8 +915,13 @@ void CaptureSession::ProcessCaptureThreadMain() {
       return;
     }
     if (!mixed.empty()) {
-      if (pending.empty()) {
-        pending_timestamp_micros = mixed_timestamp_micros;
+      // The mixer reports the QPC timestamp of the first appended sample, so a
+      // process that fell silent and resumed is visible here the same way an
+      // endpoint gap is.
+      if (ResyncTimeline(mixed_timestamp_micros, pending.size(),
+                         config_.sample_rate, emitted_through_micros,
+                         &pending_timestamp_micros)) {
+        timeline_restarted = true;
       }
       pending.insert(pending.end(), mixed.begin(), mixed.end());
       received_any_audio_.store(true);
@@ -918,11 +941,14 @@ void CaptureSession::ProcessCaptureThreadMain() {
         std::lock_guard<std::mutex> lock(mutex_);
         frame.sequence = next_sequence_++;
         frame.sample_offset = next_sample_offset_;
-        frame.timestamp_micros = pending_timestamp_micros;
+        frame.timestamp_micros = std::max<int64_t>(0, pending_timestamp_micros);
+        frame.timeline_restarted = timeline_restarted;
+        timeline_restarted = false;
         next_sample_offset_ += static_cast<int64_t>(sample_frames_per_frame);
         pending_timestamp_micros +=
             static_cast<int64_t>(sample_frames_per_frame) * 1000000 /
             std::max(1, config_.sample_rate);
+        emitted_through_micros = pending_timestamp_micros;
         admission = ring_.Add(std::move(frame));
       }
       if (admission == FrameRing::Admission::kOverflowed) {
@@ -996,8 +1022,9 @@ void CaptureSession::EchoCancelledCaptureThreadMain() {
   std::vector<float> resampled;
   std::vector<float> pending;
   const int64_t started_at = NowMillis();
-  int64_t pending_start_micros = 0;
+  int64_t pending_start_micros = kTimelineUnset;
   int64_t emitted_through_micros = 0;
+  bool timeline_restarted = false;
   bool overflowed = false;
 
   while (!stop_requested_.load()) {
@@ -1023,9 +1050,11 @@ void CaptureSession::EchoCancelledCaptureThreadMain() {
       // latency, which is a constant offset rather than a growing one.
       const int64_t block_micros = static_cast<int64_t>(cancelled.size()) *
                                    1000000 / kVoiceCaptureDspSampleRate;
-      ResyncTimeline(QpcNowMicros() - block_micros, pending.size(),
-                     config_.sample_rate, emitted_through_micros,
-                     &pending_start_micros);
+      if (ResyncTimeline(QpcNowMicros() - block_micros, pending.size(),
+                         config_.sample_rate, emitted_through_micros,
+                         &pending_start_micros)) {
+        timeline_restarted = true;
+      }
       resampled.clear();
       resampler.Process(cancelled, &resampled);
       pending.insert(pending.end(), resampled.begin(), resampled.end());
@@ -1052,6 +1081,8 @@ void CaptureSession::EchoCancelledCaptureThreadMain() {
         frame.sequence = next_sequence_++;
         frame.sample_offset = next_sample_offset_;
         frame.timestamp_micros = std::max<int64_t>(0, pending_start_micros);
+        frame.timeline_restarted = timeline_restarted;
+        timeline_restarted = false;
         next_sample_offset_ += static_cast<int64_t>(samples_per_frame);
         pending_start_micros += static_cast<int64_t>(samples_per_frame) *
                                 1000000 / std::max(1, config_.sample_rate);

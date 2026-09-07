@@ -453,6 +453,28 @@ final class AudioTimelineSynchronizer {
     );
   }
 
+  /// Timestamp of the first block this timeline has not yet emitted, or null
+  /// before anything has been emitted.
+  ///
+  /// A frame that lands before this is rejected as `late_frame`, because the
+  /// audio it belongs beside has already been written. Exposing the boundary
+  /// lets a caller place such a frame at the head — misaligned by less than one
+  /// block — instead of discarding it. Dropping is the costlier choice: the
+  /// head only moves forward, so a track that falls behind it stays behind it,
+  /// and one late frame silently ends the recording of that source.
+  Duration? get nextBlockStart {
+    final int? nextBlock = _nextBlockIndex;
+    if (nextBlock == null) {
+      return null;
+    }
+    return _sampleToDuration(nextBlock * blockFrameCount);
+  }
+
+  Duration _sampleToDuration(int sample) => Duration(
+    microseconds:
+        (sample * Duration.microsecondsPerSecond) ~/ format.sampleRate,
+  );
+
   int _durationToSample(Duration duration) =>
       ((duration.inMicroseconds * format.sampleRate) +
           (Duration.microsecondsPerSecond ~/ 2)) ~/

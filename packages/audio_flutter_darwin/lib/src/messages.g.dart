@@ -196,6 +196,7 @@ class CaptureRequestMessage {
     this.bundleIds,
     this.inputDeviceId,
     this.rawRecordingPath,
+    this.voiceProcessing,
   });
 
   CaptureKindMessage kind;
@@ -222,6 +223,13 @@ class CaptureRequestMessage {
 
   String? rawRecordingPath;
 
+  /// Whether to run the microphone through the platform voice-processing unit,
+  /// whose echo canceller removes the system output from the captured signal.
+  ///
+  /// Null and false are the same request: the raw input tap. Ignored by
+  /// system-audio capture.
+  bool? voiceProcessing;
+
   List<Object?> _toList() {
     return <Object?>[
       kind,
@@ -233,6 +241,7 @@ class CaptureRequestMessage {
       bundleIds,
       inputDeviceId,
       rawRecordingPath,
+      voiceProcessing,
     ];
   }
 
@@ -251,6 +260,7 @@ class CaptureRequestMessage {
       bundleIds: (result[6] as List<Object?>?)?.cast<String>(),
       inputDeviceId: result[7] as String?,
       rawRecordingPath: result[8] as String?,
+      voiceProcessing: result[9] as bool?,
     );
   }
 
@@ -263,7 +273,7 @@ class CaptureRequestMessage {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(kind, other.kind) && _deepEquals(outputFormat, other.outputFormat) && _deepEquals(frameDurationMicros, other.frameDurationMicros) && _deepEquals(maxBufferedDurationMicros, other.maxBufferedDurationMicros) && _deepEquals(overflowPolicy, other.overflowPolicy) && _deepEquals(processIds, other.processIds) && _deepEquals(bundleIds, other.bundleIds) && _deepEquals(inputDeviceId, other.inputDeviceId) && _deepEquals(rawRecordingPath, other.rawRecordingPath);
+    return _deepEquals(kind, other.kind) && _deepEquals(outputFormat, other.outputFormat) && _deepEquals(frameDurationMicros, other.frameDurationMicros) && _deepEquals(maxBufferedDurationMicros, other.maxBufferedDurationMicros) && _deepEquals(overflowPolicy, other.overflowPolicy) && _deepEquals(processIds, other.processIds) && _deepEquals(bundleIds, other.bundleIds) && _deepEquals(inputDeviceId, other.inputDeviceId) && _deepEquals(rawRecordingPath, other.rawRecordingPath) && _deepEquals(voiceProcessing, other.voiceProcessing);
   }
 
   @override
@@ -272,7 +282,7 @@ class CaptureRequestMessage {
 
   @override
   String toString() {
-    return 'CaptureRequestMessage(kind: $kind, outputFormat: $outputFormat, frameDurationMicros: $frameDurationMicros, maxBufferedDurationMicros: $maxBufferedDurationMicros, overflowPolicy: $overflowPolicy, processIds: $processIds, bundleIds: $bundleIds, inputDeviceId: $inputDeviceId, rawRecordingPath: $rawRecordingPath)';
+    return 'CaptureRequestMessage(kind: $kind, outputFormat: $outputFormat, frameDurationMicros: $frameDurationMicros, maxBufferedDurationMicros: $maxBufferedDurationMicros, overflowPolicy: $overflowPolicy, processIds: $processIds, bundleIds: $bundleIds, inputDeviceId: $inputDeviceId, rawRecordingPath: $rawRecordingPath, voiceProcessing: $voiceProcessing)';
   }
 }
 

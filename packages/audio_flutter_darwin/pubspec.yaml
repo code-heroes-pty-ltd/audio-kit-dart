@@ -1,5 +1,5 @@
 name: audio_flutter_darwin
-description: Darwin implementation of audio_flutter capture and PCM playback.
+description: macOS implementation of audio_flutter capture and PCM playback.
 version: 0.3.0
 resolution: workspace
 homepage: https://github.com/kshdotdev/audio-kit-dart
@@ -9,9 +9,7 @@ topics:
   - audio
   - flutter
   - macos
-  - ios
 platforms:
-  ios:
   macos:
 
 environment:
@@ -34,10 +32,6 @@ flutter:
   plugin:
     implements: audio_flutter
     platforms:
-      ios:
-        pluginClass: AudioFlutterDarwinPlugin
-        dartPluginClass: AudioFlutterDarwin
-        sharedDarwinSource: true
       macos:
         pluginClass: AudioFlutterDarwinPlugin
         dartPluginClass: AudioFlutterDarwin

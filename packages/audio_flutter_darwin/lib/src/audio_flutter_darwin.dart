@@ -52,6 +52,7 @@ final class DarwinAudioFlutterPlatform extends AudioFlutterPlatform {
         bundleIds: request.bundleIds,
         inputDeviceId: request.inputDeviceId,
         rawRecordingPath: request.rawRecordingPath,
+        voiceProcessing: request.voiceProcessing,
       ),
     );
     return PlatformCaptureSessionInfo(

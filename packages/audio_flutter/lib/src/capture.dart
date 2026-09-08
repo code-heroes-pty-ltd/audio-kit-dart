@@ -102,6 +102,7 @@ final class FlutterAudioCaptureConfig {
     this.rawRecordingPath,
     this.logicalSourceId,
     this.timingQuality,
+    this.voiceProcessing = false,
   }) : processIds = List<int>.unmodifiable(processIds),
        bundleIds = List<String>.unmodifiable(bundleIds) {
     if (frameDuration <= Duration.zero) {
@@ -194,6 +195,9 @@ final class FlutterAudioCaptureConfig {
 
   /// Optional override for the platform-reported timestamp quality.
   final MonotonicTrackTimingQuality? timingQuality;
+
+  /// Whether the platform echo canceller runs on this microphone capture.
+  final bool voiceProcessing;
 }
 
 /// Two-phase microphone or system-audio source backed by the federated plugin.
@@ -236,6 +240,7 @@ final class FlutterAudioCaptureSource implements AudioSource {
           bundleIds: config.bundleIds,
           inputDeviceId: config.inputDeviceId,
           rawRecordingPath: config.rawRecordingPath,
+          voiceProcessing: config.voiceProcessing,
         ),
       );
     } on AudioCancelledException {
@@ -738,7 +743,7 @@ final class _FlutterAudioCaptureSession implements FlutterAudioCaptureSession {
     final AudioFailure failure = AudioFailure(
       code: event.code ?? 'platform_capture_failed',
       stage: AudioFailureStage.capture,
-      message: 'Platform audio capture failed.',
+      message: event.message ?? 'Platform audio capture failed.',
       retryable: true,
     );
     _pendingPlatformFailure = failure;

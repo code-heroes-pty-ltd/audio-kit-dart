@@ -180,6 +180,7 @@ final class PlatformCaptureRequest {
     this.bundleIds = const <String>[],
     this.inputDeviceId,
     this.rawRecordingPath,
+    this.voiceProcessing = false,
   });
 
   final PlatformCaptureKind kind;
@@ -206,6 +207,19 @@ final class PlatformCaptureRequest {
 
   /// Optional source-side recording, finalized by graceful stop.
   final String? rawRecordingPath;
+
+  /// Whether the platform echo canceller runs on a microphone capture.
+  ///
+  /// The far end of a call played through the speakers is picked up by the
+  /// microphone, so a raw input tap carries it too and a per-track transcript
+  /// reports it twice. With this set the platform's own canceller removes the
+  /// system output from the microphone signal, using that output as its
+  /// reference. It costs a processed (rather than raw) microphone signal, so it
+  /// is off by default and opt-in per capture.
+  ///
+  /// Ignored by system-audio captures, which have no echo to cancel, and by
+  /// platforms with no canceller of their own.
+  final bool voiceProcessing;
 }
 
 /// Opaque prepared capture information.

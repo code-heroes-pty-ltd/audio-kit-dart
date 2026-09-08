@@ -57,6 +57,16 @@ int64_t IntArg(const flutter::EncodableMap& map, const char* key,
   return fallback;
 }
 
+bool BoolArg(const flutter::EncodableMap& map, const char* key,
+             bool fallback) {
+  const flutter::EncodableValue* value = Find(map, key);
+  if (value == nullptr) {
+    return fallback;
+  }
+  const auto* flag = std::get_if<bool>(value);
+  return flag == nullptr ? fallback : *flag;
+}
+
 std::string StringArg(const flutter::EncodableMap& map, const char* key) {
   const flutter::EncodableValue* value = Find(map, key);
   if (value == nullptr) {
@@ -130,6 +140,12 @@ flutter::EncodableValue FrameToValue(int64_t session_id,
       flutter::EncodableValue(frame.timestamp_micros);
   map[flutter::EncodableValue("droppedFramesBefore")] =
       flutter::EncodableValue(frame.dropped_frames_before);
+  if (frame.timeline_restarted) {
+    // The host places frames by counting samples from an anchor and only
+    // re-reads a frame's timestamp when it is told the timeline restarted.
+    map[flutter::EncodableValue("discontinuityReason")] =
+        flutter::EncodableValue("sourceRestart");
+  }
   map[flutter::EncodableValue("samples")] =
       flutter::EncodableValue(std::move(payload));
   return flutter::EncodableValue(std::move(map));
@@ -177,6 +193,26 @@ AudioFlutterWindowsPlugin::AudioFlutterWindowsPlugin(
             return nullptr;
           }));
 
+  workers_.reserve(kWorkerCount);
+  for (size_t index = 0; index < kWorkerCount; ++index) {
+    workers_.emplace_back([this]() {
+      for (;;) {
+        std::function<void()> task;
+        {
+          std::unique_lock<std::mutex> lock(work_mutex_);
+          work_available_.wait(
+              lock, [this] { return workers_stopping_ || !work_.empty(); });
+          if (work_.empty()) {
+            return;
+          }
+          task = std::move(work_.front());
+          work_.pop();
+        }
+        task();
+      }
+    });
+  }
+
   window_proc_id_ = registrar_->RegisterTopLevelWindowProcDelegate(
       [this](HWND, UINT message, WPARAM, LPARAM) -> std::optional<LRESULT> {
         if (message == WM_AFW_RUN_TASK) {
@@ -191,6 +227,35 @@ AudioFlutterWindowsPlugin::~AudioFlutterWindowsPlugin() {
   if (window_proc_id_ != -1) {
     registrar_->UnregisterTopLevelWindowProcDelegate(window_proc_id_);
   }
+  // Wake whatever the workers are blocked in before joining them. A playback
+  // write waits for buffer space with no timeout at all, and both waits are
+  // released by stopping the session — so the sessions are aborted first,
+  // while they still exist, and destroyed once no worker can touch them.
+  // Joining first would wait on a writer that nothing has told to stop.
+  {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    for (auto& entry : captures_) {
+      entry.second->Abort();
+    }
+    for (auto& entry : playbacks_) {
+      entry.second->Abort();
+    }
+  }
+  // Workers run tasks that touch the sessions and the channels, so they are
+  // drained and joined before either goes away. Queued work is allowed to
+  // finish: a task abandoned mid-flight is one that never answers its call,
+  // and its `MethodResult` would be destroyed with the reply still owed.
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    workers_stopping_ = true;
+  }
+  work_available_.notify_all();
+  for (std::thread& worker : workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  workers_.clear();
   // Sessions own threads that call back into this plugin; drop them before the
   // channels and task queue disappear.
   std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -211,17 +276,24 @@ void AudioFlutterWindowsPlugin::HandleMethodCall(
     return;
   }
   if (method == "startCapture") {
-    CaptureSession* session = FindCapture(args);
+    std::shared_ptr<CaptureSession> session = FindCapture(args);
     if (session == nullptr) {
       result->Error("SessionNotFound", "no such capture session");
       return;
     }
-    std::string error;
-    if (!session->Start(&error)) {
-      result->Error("CaptureFailed", error);
-      return;
-    }
-    result->Success();
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+        std::move(result));
+    RunOffPlatformThread([this, session, reply]() {
+      std::string error;
+      const bool started = session->Start(&error);
+      RunOnPlatformThread([reply, started, error]() {
+        if (started) {
+          reply->Success();
+        } else {
+          reply->Error("CaptureFailed", error);
+        }
+      });
+    });
     return;
   }
   if (method == "readCaptureFrames") {
@@ -229,22 +301,29 @@ void AudioFlutterWindowsPlugin::HandleMethodCall(
     return;
   }
   if (method == "stopCapture" || method == "abortCapture") {
-    CaptureSession* session = FindCapture(args);
+    std::shared_ptr<CaptureSession> session = FindCapture(args);
     if (session == nullptr) {
       result->Error("SessionNotFound", "no such capture session");
       return;
     }
-    if (method == "stopCapture") {
-      session->Stop();
-    } else {
-      session->Abort();
-    }
-    result->Success();
+    // Both join the capture thread, which is mid-poll and only notices the
+    // stop request between its 5 ms sleeps.
+    const bool graceful = method == "stopCapture";
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+        std::move(result));
+    RunOffPlatformThread([this, session, graceful, reply]() {
+      if (graceful) {
+        session->Stop();
+      } else {
+        session->Abort();
+      }
+      RunOnPlatformThread([reply]() { reply->Success(); });
+    });
     return;
   }
   if (method == "disposeCapture") {
     const int64_t session_id = IntArg(args, "sessionId", 0);
-    std::unique_ptr<CaptureSession> session;
+    std::shared_ptr<CaptureSession> session;
     {
       std::lock_guard<std::mutex> lock(sessions_mutex_);
       const auto it = captures_.find(session_id);
@@ -253,10 +332,16 @@ void AudioFlutterWindowsPlugin::HandleMethodCall(
         captures_.erase(it);
       }
     }
-    // Destroyed outside the lock: the destructor joins the capture thread,
-    // which may still be posting events.
-    session.reset();
-    result->Success();
+    // Removed from the registry on the platform thread, so a later call cannot
+    // find a session being torn down, but released on a worker: the destructor
+    // joins the capture thread, and a read still in flight holds its own
+    // reference, so whichever finishes last does the destroying.
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+        std::move(result));
+    RunOffPlatformThread([this, session = std::move(session), reply]() mutable {
+      session.reset();
+      RunOnPlatformThread([reply]() { reply->Success(); });
+    });
     return;
   }
 
@@ -271,46 +356,67 @@ void AudioFlutterWindowsPlugin::HandleMethodCall(
     result->Success(flutter::EncodableValue(IsProcessLoopbackSupported()));
     return;
   }
-  if (method == "listAudioInputDevices") {
-    result->Success(ListEndpoints(eCapture));
-    return;
-  }
-  if (method == "listSystemAudioSources") {
-    result->Success(ListEndpoints(eRender));
+  if (method == "listAudioInputDevices" || method == "listSystemAudioSources") {
+    // Endpoint enumeration opens every device's property store for its name.
+    const EDataFlow flow =
+        method == "listAudioInputDevices" ? eCapture : eRender;
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+        std::move(result));
+    RunOffPlatformThread([this, flow, reply]() {
+      flutter::EncodableValue endpoints = ListEndpoints(flow);
+      RunOnPlatformThread(
+          [reply, endpoints = std::move(endpoints)]() mutable {
+            reply->Success(std::move(endpoints));
+          });
+    });
     return;
   }
   if (method == "listAudioProcesses") {
-    flutter::EncodableList encoded;
-    for (const AudioProcessInfo& process : ListAudioRenderProcesses()) {
-      flutter::EncodableMap entry;
-      entry[flutter::EncodableValue("processId")] =
-          flutter::EncodableValue(static_cast<int64_t>(process.process_id));
-      entry[flutter::EncodableValue("bundleId")] =
-          flutter::EncodableValue(process.application_id);
-      entry[flutter::EncodableValue("isProducingAudio")] =
-          flutter::EncodableValue(process.is_producing_audio);
-      encoded.push_back(flutter::EncodableValue(std::move(entry)));
-    }
-    result->Success(flutter::EncodableValue(std::move(encoded)));
+    // Walks every render session on the default endpoint and resolves each
+    // owning process, which is a registry and process-handle round trip apiece.
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+        std::move(result));
+    RunOffPlatformThread([this, reply]() {
+      flutter::EncodableList encoded;
+      for (const AudioProcessInfo& process : ListAudioRenderProcesses()) {
+        flutter::EncodableMap entry;
+        entry[flutter::EncodableValue("processId")] =
+            flutter::EncodableValue(static_cast<int64_t>(process.process_id));
+        entry[flutter::EncodableValue("bundleId")] =
+            flutter::EncodableValue(process.application_id);
+        entry[flutter::EncodableValue("isProducingAudio")] =
+            flutter::EncodableValue(process.is_producing_audio);
+        encoded.push_back(flutter::EncodableValue(std::move(entry)));
+      }
+      RunOnPlatformThread([reply, encoded = std::move(encoded)]() mutable {
+        reply->Success(flutter::EncodableValue(std::move(encoded)));
+      });
+    });
     return;
   }
-
   if (method == "preparePlayback") {
     PreparePlayback(args, std::move(result));
     return;
   }
   if (method == "startPlayback") {
-    PlaybackSession* session = FindPlayback(args);
+    std::shared_ptr<PlaybackSession> session = FindPlayback(args);
     if (session == nullptr) {
       result->Error("SessionNotFound", "no such playback session");
       return;
     }
-    std::string error;
-    if (!session->Start(&error)) {
-      result->Error("PlaybackFailed", error);
-      return;
-    }
-    result->Success();
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+        std::move(result));
+    RunOffPlatformThread([this, session, reply]() {
+      std::string error;
+      const bool started = session->Start(&error);
+      RunOnPlatformThread([reply, started, error]() {
+        if (started) {
+          reply->Success();
+        } else {
+          reply->Error("PlaybackFailed", error);
+        }
+      });
+    });
     return;
   }
   if (method == "writePlaybackFrames") {
@@ -318,22 +424,29 @@ void AudioFlutterWindowsPlugin::HandleMethodCall(
     return;
   }
   if (method == "finishPlayback" || method == "abortPlayback") {
-    PlaybackSession* session = FindPlayback(args);
+    std::shared_ptr<PlaybackSession> session = FindPlayback(args);
     if (session == nullptr) {
       result->Error("SessionNotFound", "no such playback session");
       return;
     }
-    if (method == "finishPlayback") {
-      session->Finish();
-    } else {
-      session->Abort();
-    }
-    result->Success();
+    // `Finish` drains the render buffer before returning, so it blocks for as
+    // long as there is audio left to play.
+    const bool graceful = method == "finishPlayback";
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+        std::move(result));
+    RunOffPlatformThread([this, session, graceful, reply]() {
+      if (graceful) {
+        session->Finish();
+      } else {
+        session->Abort();
+      }
+      RunOnPlatformThread([reply]() { reply->Success(); });
+    });
     return;
   }
   if (method == "disposePlayback") {
     const int64_t session_id = IntArg(args, "sessionId", 0);
-    std::unique_ptr<PlaybackSession> session;
+    std::shared_ptr<PlaybackSession> session;
     {
       std::lock_guard<std::mutex> lock(sessions_mutex_);
       const auto it = playbacks_.find(session_id);
@@ -342,8 +455,12 @@ void AudioFlutterWindowsPlugin::HandleMethodCall(
         playbacks_.erase(it);
       }
     }
-    session.reset();
-    result->Success();
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+        std::move(result));
+    RunOffPlatformThread([this, session = std::move(session), reply]() mutable {
+      session.reset();
+      RunOnPlatformThread([reply]() { reply->Success(); });
+    });
     return;
   }
 
@@ -367,6 +484,7 @@ void AudioFlutterWindowsPlugin::PrepareCapture(
   config.overflow_policy =
       ParseOverflowPolicy(StringArg(arguments, "overflowPolicy"));
   config.endpoint_id = StringArg(arguments, "inputDeviceId");
+  config.voice_processing = BoolArg(arguments, "voiceProcessing", false);
   config.process_ids = ProcessIdsArg(arguments, "processIds");
 
   const flutter::EncodableValue* encoded_process_ids =
@@ -392,32 +510,50 @@ void AudioFlutterWindowsPlugin::PrepareCapture(
   }
 
   int64_t session_id = 0;
-  CaptureSession* session = nullptr;
+  std::shared_ptr<CaptureSession> session;
   {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     session_id = next_session_id_++;
-    auto owned = std::make_unique<CaptureSession>(
+    session = std::make_shared<CaptureSession>(
         session_id, config,
         [this](SessionEvent event) { PostEvent(std::move(event)); });
-    session = owned.get();
-    captures_[session_id] = std::move(owned);
+    captures_[session_id] = session;
   }
 
-  std::string error;
-  if (!session->Prepare(&error)) {
-    {
-      std::lock_guard<std::mutex> lock(sessions_mutex_);
-      captures_.erase(session_id);
+  // `Prepare` initialises COM, enumerates endpoints and opens the chosen one's
+  // property store; it is the reason a capture start visibly stutters the UI.
+  std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+      std::move(result));
+  RunOffPlatformThread([this, session, session_id, config, reply]() {
+    std::string error;
+    if (!session->Prepare(&error)) {
+      {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        captures_.erase(session_id);
+      }
+      RunOnPlatformThread([reply, error]() {
+        reply->Error("CaptureFailed", error);
+      });
+      return;
     }
-    result->Error("CaptureFailed", error);
-    return;
-  }
+    RunOnPlatformThread([this, reply, session, session_id, config]() {
+      ReplyWithCaptureInfo(reply, *session, session_id, config);
+    });
+  });
+}
 
+// Builds the prepared-session reply. Split out so `PrepareCapture` can send it
+// from the platform thread after the work has run on a worker.
+void AudioFlutterWindowsPlugin::ReplyWithCaptureInfo(
+    const std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>>&
+        result,
+    const CaptureSession& session, int64_t session_id,
+    const CaptureConfig& config) {
   flutter::EncodableMap info;
   info[flutter::EncodableValue("sessionId")] =
       flutter::EncodableValue(session_id);
   info[flutter::EncodableValue("sourceId")] =
-      flutter::EncodableValue(session->source_id());
+      flutter::EncodableValue(session.source_id());
   info[flutter::EncodableValue("trackId")] = flutter::EncodableValue(
       config.kind == CaptureKind::kMicrophone ? "microphone" : "systemAudio");
   info[flutter::EncodableValue("clockId")] =
@@ -434,7 +570,7 @@ void AudioFlutterWindowsPlugin::PrepareCapture(
 void AudioFlutterWindowsPlugin::ReadCaptureFrames(
     const flutter::EncodableMap& arguments,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  CaptureSession* session = FindCapture(arguments);
+  std::shared_ptr<CaptureSession> session = FindCapture(arguments);
   if (session == nullptr) {
     result->Error("SessionNotFound", "no such capture session");
     return;
@@ -443,22 +579,32 @@ void AudioFlutterWindowsPlugin::ReadCaptureFrames(
       static_cast<size_t>(std::max<int64_t>(0, IntArg(arguments, "maxFrames", 8)));
   const int64_t timeout_millis = IntArg(arguments, "timeoutMillis", 500);
 
-  std::vector<CapturedFrame> frames;
-  bool end_of_stream = false;
-  session->Read(max_frames, timeout_millis, &frames, &end_of_stream);
+  // The read waits on the frame ring for up to its full timeout, and Dart pulls
+  // continuously for as long as the capture runs. This is the call that has to
+  // leave the platform thread: the others stall the window at a device change,
+  // this one stalls it permanently.
+  std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+      std::move(result));
+  RunOffPlatformThread([this, session, max_frames, timeout_millis, reply]() {
+    std::vector<CapturedFrame> frames;
+    bool end_of_stream = false;
+    session->Read(max_frames, timeout_millis, &frames, &end_of_stream);
 
-  flutter::EncodableList encoded;
-  encoded.reserve(frames.size());
-  for (const CapturedFrame& frame : frames) {
-    encoded.push_back(FrameToValue(session->session_id(), frame));
-  }
+    flutter::EncodableList encoded;
+    encoded.reserve(frames.size());
+    for (const CapturedFrame& frame : frames) {
+      encoded.push_back(FrameToValue(session->session_id(), frame));
+    }
 
-  flutter::EncodableMap batch;
-  batch[flutter::EncodableValue("frames")] =
-      flutter::EncodableValue(std::move(encoded));
-  batch[flutter::EncodableValue("endOfStream")] =
-      flutter::EncodableValue(end_of_stream);
-  result->Success(flutter::EncodableValue(std::move(batch)));
+    flutter::EncodableMap batch;
+    batch[flutter::EncodableValue("frames")] =
+        flutter::EncodableValue(std::move(encoded));
+    batch[flutter::EncodableValue("endOfStream")] =
+        flutter::EncodableValue(end_of_stream);
+    RunOnPlatformThread([reply, batch = std::move(batch)]() mutable {
+      reply->Success(flutter::EncodableValue(std::move(batch)));
+    });
+  });
 }
 
 void AudioFlutterWindowsPlugin::PreparePlayback(
@@ -477,43 +623,51 @@ void AudioFlutterWindowsPlugin::PreparePlayback(
   }
 
   int64_t session_id = 0;
-  PlaybackSession* session = nullptr;
+  std::shared_ptr<PlaybackSession> session;
   {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     session_id = next_session_id_++;
-    auto owned = std::make_unique<PlaybackSession>(
+    session = std::make_shared<PlaybackSession>(
         session_id, config,
         [this](SessionEvent event) { PostEvent(std::move(event)); });
-    session = owned.get();
-    playbacks_[session_id] = std::move(owned);
+    playbacks_[session_id] = session;
   }
 
-  std::string error;
-  if (!session->Prepare(&error)) {
-    {
-      std::lock_guard<std::mutex> lock(sessions_mutex_);
-      playbacks_.erase(session_id);
+  // Opens the render endpoint, which is the same COM and device work a capture
+  // prepare does.
+  std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+      std::move(result));
+  RunOffPlatformThread([this, session, session_id, config, reply]() {
+    std::string error;
+    if (!session->Prepare(&error)) {
+      {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        playbacks_.erase(session_id);
+      }
+      RunOnPlatformThread([reply, error]() {
+        reply->Error("PlaybackFailed", error);
+      });
+      return;
     }
-    result->Error("PlaybackFailed", error);
-    return;
-  }
-
-  flutter::EncodableMap info;
-  info[flutter::EncodableValue("sessionId")] =
-      flutter::EncodableValue(session_id);
-  info[flutter::EncodableValue("clockId")] =
-      flutter::EncodableValue("wasapi-render");
-  info[flutter::EncodableValue("sampleRate")] =
-      flutter::EncodableValue(config.sample_rate);
-  info[flutter::EncodableValue("channelCount")] =
-      flutter::EncodableValue(config.channel_count);
-  result->Success(flutter::EncodableValue(std::move(info)));
+    flutter::EncodableMap info;
+    info[flutter::EncodableValue("sessionId")] =
+        flutter::EncodableValue(session_id);
+    info[flutter::EncodableValue("clockId")] =
+        flutter::EncodableValue("wasapi-render");
+    info[flutter::EncodableValue("sampleRate")] =
+        flutter::EncodableValue(config.sample_rate);
+    info[flutter::EncodableValue("channelCount")] =
+        flutter::EncodableValue(config.channel_count);
+    RunOnPlatformThread([reply, info = std::move(info)]() mutable {
+      reply->Success(flutter::EncodableValue(std::move(info)));
+    });
+  });
 }
 
 void AudioFlutterWindowsPlugin::WritePlaybackFrames(
     const flutter::EncodableMap& arguments,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  PlaybackSession* session = FindPlayback(arguments);
+  std::shared_ptr<PlaybackSession> session = FindPlayback(arguments);
   if (session == nullptr) {
     result->Error("SessionNotFound", "no such playback session");
     return;
@@ -549,8 +703,15 @@ void AudioFlutterWindowsPlugin::WritePlaybackFrames(
     std::memcpy(samples.data() + offset, payload->data(), payload->size());
   }
 
-  session->Write(samples);
-  result->Success();
+  // `Write` blocks while the render buffer is full, which is the steady state
+  // of a playback that is keeping up.
+  std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> reply(
+      std::move(result));
+  RunOffPlatformThread(
+      [this, session, samples = std::move(samples), reply]() mutable {
+        session->Write(samples);
+        RunOnPlatformThread([reply]() { reply->Success(); });
+      });
 }
 
 flutter::EncodableValue AudioFlutterWindowsPlugin::ListEndpoints(
@@ -628,20 +789,20 @@ flutter::EncodableValue AudioFlutterWindowsPlugin::ListEndpoints(
   return flutter::EncodableValue(std::move(devices));
 }
 
-CaptureSession* AudioFlutterWindowsPlugin::FindCapture(
+std::shared_ptr<CaptureSession> AudioFlutterWindowsPlugin::FindCapture(
     const flutter::EncodableMap& arguments) {
   const int64_t session_id = IntArg(arguments, "sessionId", 0);
   std::lock_guard<std::mutex> lock(sessions_mutex_);
   const auto it = captures_.find(session_id);
-  return it == captures_.end() ? nullptr : it->second.get();
+  return it == captures_.end() ? nullptr : it->second;
 }
 
-PlaybackSession* AudioFlutterWindowsPlugin::FindPlayback(
+std::shared_ptr<PlaybackSession> AudioFlutterWindowsPlugin::FindPlayback(
     const flutter::EncodableMap& arguments) {
   const int64_t session_id = IntArg(arguments, "sessionId", 0);
   std::lock_guard<std::mutex> lock(sessions_mutex_);
   const auto it = playbacks_.find(session_id);
-  return it == playbacks_.end() ? nullptr : it->second.get();
+  return it == playbacks_.end() ? nullptr : it->second;
 }
 
 void AudioFlutterWindowsPlugin::PostEvent(SessionEvent event) {
@@ -670,6 +831,18 @@ void AudioFlutterWindowsPlugin::PostEvent(SessionEvent event) {
   });
 }
 
+void AudioFlutterWindowsPlugin::RunOffPlatformThread(
+    std::function<void()> task) {
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    if (workers_stopping_) {
+      return;
+    }
+    work_.push(std::move(task));
+  }
+  work_available_.notify_one();
+}
+
 void AudioFlutterWindowsPlugin::RunOnPlatformThread(
     std::function<void()> task) {
   {
@@ -679,7 +852,11 @@ void AudioFlutterWindowsPlugin::RunOnPlatformThread(
   if (HWND window = registrar_->GetView() == nullptr
                         ? nullptr
                         : registrar_->GetView()->GetNativeWindow()) {
-    ::PostMessage(window, WM_AFW_RUN_TASK, 0, 0);
+    // GetNativeWindow() is the child Flutter view, whose window procedure
+    // discards private messages. The top-level WindowProc delegate registered
+    // in the constructor only sees messages sent to the root window, so post
+    // there or the drain never runs and every offloaded reply is lost.
+    ::PostMessage(::GetAncestor(window, GA_ROOT), WM_AFW_RUN_TASK, 0, 0);
   }
 }
 

@@ -3,13 +3,9 @@ import AudioFlutterDarwinCore
 import Foundation
 import os
 
-#if os(iOS)
-  import Flutter
-#elseif os(macOS)
-  import AudioToolbox
-  import CoreAudio
-  import FlutterMacOS
-#endif
+import AudioToolbox
+import CoreAudio
+import FlutterMacOS
 
 final class MicrophoneCaptureSession: NativeCaptureSession {
   let sessionId: Int64
@@ -18,7 +14,9 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
 
   private let request: CaptureRequestMessage
   private let events: SessionEventsHandler
-  private let engine = AVAudioEngine()
+  /// Replaced outright when a configuration change leaves the old instance
+  /// unable to start; see `recreateEngineLocked`.
+  private var engine = AVAudioEngine()
   private let workerQueue = DispatchQueue(
     label: "audio_flutter.microphone.worker",
     qos: .userInitiated
@@ -41,6 +39,20 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
   /// Bumped by every completed tap reinstall. The delivery watchdog reads it to
   /// tell "this chain was just rebuilt" from "this chain is dead".
   private let tapGeneration = CompatibleUnfairLock(initialState: Int64(0))
+  /// How long a configuration-change burst is allowed to settle before the tap
+  /// is reinstalled. Long enough to coalesce a Bluetooth connect's several
+  /// notifications, short enough to stay well inside one supervision window.
+  private static let reconfigureDebounceSeconds = 0.25
+  /// Bumped by every configuration-change notification. Only the delayed work
+  /// item whose generation still matches goes on to reinstall.
+  private let reconfigureGeneration = CompatibleUnfairLock(initialState: Int64(0))
+  /// Consecutive failed engine restarts. Reset by the first one that succeeds.
+  private let restartAttempts = CompatibleUnfairLock(initialState: 0)
+  /// How many times a restart is retried before the session is failed. A
+  /// Bluetooth device can refuse to start for several hundred milliseconds
+  /// while it settles, and that is a transition, not a death.
+  private static let maximumRestartAttempts = 5
+  private static let restartRetryDelaySeconds = 0.4
   private var assembler: CaptureFrameAssembler?
   private var converter: PersistentAudioConverter?
   private var recorder: RawAudioRecorder?
@@ -49,6 +61,10 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
   private var recorderFormat: AVAudioFormat?
   private var configurationObserver: NSObjectProtocol?
   private var watchdog: Task<Void, Never>?
+  /// Why the platform echo canceller could not be enabled, when it was asked
+  /// for and refused. Reported once the session reaches `running`, since a
+  /// capture that records the far end is still a working capture.
+  private var voiceProcessingFailure: String?
 
   init(
     sessionId: Int64,
@@ -74,31 +90,19 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     )
     mailbox = FrameMailbox(capacity: capacity, overflowPolicy: request.overflowPolicy)
 
-    #if os(macOS)
-      if let uid = request.inputDeviceId, !uid.isEmpty,
-        !AudioInputDeviceSelection.apply(uid: uid, to: engine)
-      {
-        throw PigeonError(
-          code: "InputDeviceUnavailable",
-          message: "The selected audio input device is unavailable.",
-          details: nil
-        )
-      }
-    #elseif os(iOS)
-      if let uid = request.inputDeviceId, !uid.isEmpty {
-        let session = AVAudioSession.sharedInstance()
-        guard
-          let input = session.availableInputs?.first(where: { $0.uid == uid })
-        else {
-          throw PigeonError(
-            code: "InputDeviceUnavailable",
-            message: "The selected audio input device is unavailable.",
-            details: nil
-          )
-        }
-        try session.setPreferredInput(input)
-      }
-    #endif
+    if let uid = request.inputDeviceId, !uid.isEmpty,
+      !AudioInputDeviceSelection.apply(uid: uid, to: engine)
+    {
+      throw PigeonError(
+        code: "InputDeviceUnavailable",
+        message: "The selected audio input device is unavailable.",
+        details: nil
+      )
+    }
+    // Before the format is read: the voice-processing unit presents its own
+    // format, so a read taken ahead of this describes the raw input node that
+    // is about to be replaced.
+    enableVoiceProcessingLocked()
     let input = engine.inputNode
     let inputFormat = input.outputFormat(forBus: 0)
     guard
@@ -132,15 +136,6 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     lifecycle.lock()
     defer { lifecycle.unlock() }
     guard !running.withLock({ $0 }) else { return }
-    #if os(iOS)
-      let audioSession = AVAudioSession.sharedInstance()
-      try audioSession.setCategory(
-        .playAndRecord,
-        mode: .default,
-        options: [.defaultToSpeaker, .allowBluetoothHFP]
-      )
-      try audioSession.setActive(true)
-    #endif
 
     let input = engine.inputNode
     // Selecting the input device during prepare (and a Bluetooth HFP
@@ -149,6 +144,10 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     // through labeled 48 kHz — the 2x "chipmunk" recording. Read the format
     // once here and rebuild the converter from that same read, so the
     // converter and the tap can never disagree.
+    // Re-asserted here for the same reason the converter is rebuilt from a
+    // fresh read: the node this session prepared against may have been
+    // replaced since, and voice processing does not survive that.
+    enableVoiceProcessingLocked()
     let liveFormat = input.outputFormat(forBus: 0)
     guard
       liveFormat.sampleRate > 0,
@@ -175,7 +174,7 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
       recorder = try RawAudioRecorder(path: path, inputFormat: liveFormat)
       recorderFormat = liveFormat
     }
-    installTapLocked(format: liveFormat)
+    installTapLocked()
     // Registered before start so the configuration change that engine.start()
     // itself provokes is delivered instead of racing the registration.
     observeConfigurationChangesLocked()
@@ -191,12 +190,6 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
       workRing.finish(discardBuffered: true)
       workerQueue.sync {}
       mailbox.finish(discardBuffered: true)
-      #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(
-          false,
-          options: .notifyOthersOnDeactivation
-        )
-      #endif
       throw error
     }
     setActivityHold(true)
@@ -208,8 +201,46 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
         callbackCount: 0
       )
     )
+    if let voiceProcessingFailure {
+      events.emit(
+        healthEvent(
+          phase: .running,
+          code: "MicrophoneVoiceProcessingUnavailable",
+          message: voiceProcessingFailure,
+          receivingAudio: false,
+          statistics: nil
+        )
+      )
+    }
     watchdog = Task { [weak self] in
       await self?.superviseDelivery()
+    }
+  }
+
+  /// Routes the input node through the platform voice-processing unit when the
+  /// request asked for it.
+  private func enableVoiceProcessingLocked() {
+    guard request.voiceProcessing == true else { return }
+    let input = engine.inputNode
+    if !input.isVoiceProcessingEnabled {
+      do {
+        try input.setVoiceProcessingEnabled(true)
+      } catch {
+        voiceProcessingFailure =
+          "The platform echo canceller could not be enabled, so the "
+          + "microphone still records audio played through the speakers: "
+          + "\(error.localizedDescription)"
+        return
+      }
+    }
+    voiceProcessingFailure = nil
+    input.isVoiceProcessingAGCEnabled = false
+    if #available(macOS 14.0, iOS 17.0, *) {
+      input.voiceProcessingOtherAudioDuckingConfiguration =
+        AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+          enableAdvancedDucking: false,
+          duckingLevel: .min
+        )
     }
   }
 
@@ -218,8 +249,21 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
   /// Called with `lifecycle` held from both the initial start and every
   /// reinstall, so the callback body exists once and both paths count render
   /// cycles the same way.
-  private func installTapLocked(format: AVAudioFormat) {
-    engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) {
+  /// Installs the input tap without asserting a format.
+  ///
+  /// `installTap(onBus:bufferSize:format:)` raises an **NSException** when the
+  /// format it is handed is not the bus's current format. That is not a Swift
+  /// error, so no caller here can catch it and the process terminates. Every
+  /// call site reads the node's format and then does work before installing —
+  /// converter construction, `removeTap`, a synchronous worker drain — and a
+  /// Bluetooth connect moves the hardware format several times across that
+  /// window, so the read is routinely stale by the time it is asserted.
+  ///
+  /// Passing `nil` binds the tap to whatever the bus reports at install time,
+  /// which is the only value that cannot be wrong. Buffers then carry their own
+  /// format and [ensureConverterMatches] converts from that.
+  private func installTapLocked() {
+    engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) {
       [weak self] buffer, time in
       guard let self, self.running.withLock({ $0 }) else { return }
       self.renderCycles.withLock { $0 += 1 }
@@ -385,8 +429,19 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
   /// immediately: the rebuild takes `lifecycle`, which teardown also holds.
   private func handleConfigurationChange() {
     guard running.withLock({ $0 }) else { return }
-    reconfigureQueue.async { [weak self] in
+    // A Bluetooth connect posts several of these as the device is added, made
+    // default, and negotiates its profile. Reinstalling on the first one
+    // rebuilds against a format that is still moving, so only the last
+    // notification of a burst does the work.
+    let generation = reconfigureGeneration.withLock { state -> Int64 in
+      state += 1
+      return state
+    }
+    reconfigureQueue.asyncAfter(
+      deadline: .now() + Self.reconfigureDebounceSeconds
+    ) { [weak self] in
       guard let self, self.running.withLock({ $0 }) else { return }
+      guard self.reconfigureGeneration.withLock({ $0 }) == generation else { return }
       guard case .reinstalled = self.reinstallTap() else { return }
       self.events.emit(
         self.healthEvent(
@@ -419,37 +474,81 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
       lifecycle.unlock()
       return .skipped
     }
-    let input = engine.inputNode
-    let inputFormat = input.outputFormat(forBus: 0)
-    guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+    // A restart that already failed means this engine is holding hardware
+    // state that neither stop() nor reset() clears, so the cheap repair is
+    // spent and the next attempt replaces the instance outright.
+    let recreateEngine = restartAttempts.withLock { $0 > 0 }
+
+    let probeInput = engine.inputNode
+    // Probed before anything is torn down: a node reporting no usable format is
+    // mid-transition, and the tap already installed is worth more than none.
+    // A recreate skips the probe — an engine bound to departed hardware has
+    // nothing truthful left to say about what replaced it.
+    let probeFormat = probeInput.outputFormat(forBus: 0)
+    if !recreateEngine,
+      probeFormat.sampleRate <= 0 || probeFormat.channelCount <= 0
+    {
       lifecycle.unlock()
       return .skipped
     }
-    guard
+
+    probeInput.removeTap(onBus: 0)
+    // No callback can enqueue past this point, so draining the worker leaves
+    // the converter, recorder, and assembler free to be swapped.
+    workerQueue.sync {}
+    // A configuration change leaves the engine stopped but still holding graph
+    // state bound to the departed hardware. Starting it against the new device
+    // in that state fails with kAudioUnitErr_FormatNotSupported (-10868), so
+    // the stale state is dropped before anything is rebuilt on top of it.
+    engine.stop()
+    if recreateEngine {
+      recreateEngineLocked()
+    } else {
+      engine.reset()
+    }
+    #if os(macOS)
+      // The AUHAL's current-device property survives neither a reset nor a
+      // recreate, so an explicitly selected input has to be re-asserted or the
+      // engine quietly reverts to the system default mid-recording.
+      if let uid = request.inputDeviceId, !uid.isEmpty {
+        _ = AudioInputDeviceSelection.apply(uid: uid, to: engine)
+      }
+    #endif
+    // A reset drops the voice-processing unit and a recreate drops the whole
+    // node, so the canceller has to be re-established before the format that
+    // describes it is read.
+    enableVoiceProcessingLocked()
+    // Re-read from the current engine — `probeInput` belongs to the instance
+    // that may have just been replaced. The node settles onto the new hardware
+    // as part of the reset, so this is the first read that can describe it.
+    let settledFormat = engine.inputNode.outputFormat(forBus: 0)
+    let inputFormat =
+      settledFormat.sampleRate > 0 && settledFormat.channelCount > 0
+      ? settledFormat : probeFormat
+    let inputFormatIsUsable =
+      inputFormat.sampleRate > 0 && inputFormat.channelCount > 0
+    // This converter is only a first guess, and building it is no longer
+    // fatal if it fails: the tap asserts no format, so `ensureConverterMatches`
+    // rebuilds it from the first buffer that actually arrives if the hardware
+    // is still moving.
+    if inputFormatIsUsable,
       let converter = PersistentAudioConverter(
         inputFormat: inputFormat,
         sampleRate: Double(request.outputFormat.sampleRate),
         channelCount: AVAudioChannelCount(request.outputFormat.channelCount)
       )
-    else {
-      lifecycle.unlock()
-      fail(
-        code: "ConverterUnavailable",
-        message: "Could not convert microphone format \(inputFormat)"
-      )
-      return .failed
+    {
+      self.converter = converter
     }
-
-    input.removeTap(onBus: 0)
-    // No callback can enqueue past this point, so draining the worker leaves
-    // the converter, recorder, and assembler free to be swapped.
-    workerQueue.sync {}
-    self.converter = converter
     // The host-time clock survives the rebuild, so the next buffer reports the
     // gap as a source restart instead of being spliced onto pre-change audio.
     assembler?.markSourceRestart()
-    let recordingEnded = closeRecorderIfFormatChangedLocked(to: inputFormat)
-    installTapLocked(format: inputFormat)
+    // The source-native recording is only closed against a format we trust —
+    // closing it on a transitional read could end a file that is still fine.
+    let recordingEnded =
+      inputFormatIsUsable
+      ? closeRecorderIfFormatChangedLocked(to: inputFormat) : false
+    installTapLocked()
     var startError: Error?
     if !engine.isRunning {
       engine.prepare()
@@ -463,14 +562,47 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     lifecycle.unlock()
 
     if let startError {
+      // A device that is still negotiating refuses to start, and that is a
+      // transition rather than a death — the same distinction the delivery
+      // watchdog is built around. Retry a bounded number of times before
+      // treating it as fatal, so a Bluetooth connect cannot end the session
+      // just for being slow.
+      let attempt = restartAttempts.withLock { state -> Int in
+        state += 1
+        return state
+      }
+      guard attempt >= Self.maximumRestartAttempts else {
+        events.emit(
+          healthEvent(
+            phase: .interrupted,
+            code: "MicrophoneEngineRestartRetrying",
+            message:
+              "The audio engine did not restart after a microphone "
+              + "configuration change (attempt \(attempt) of "
+              + "\(Self.maximumRestartAttempts), retrying with a fresh "
+              + "engine): \(startError.localizedDescription)",
+            receivingAudio: false,
+            statistics: assembler?.statistics()
+          )
+        )
+        reconfigureQueue.asyncAfter(
+          deadline: .now() + Self.restartRetryDelaySeconds
+        ) { [weak self] in
+          guard let self, self.running.withLock({ $0 }) else { return }
+          _ = self.reinstallTap()
+        }
+        return .skipped
+      }
       fail(
         code: "MicrophoneEngineRestartFailed",
         message:
           "The audio engine could not restart after a microphone "
-          + "configuration change: \(startError.localizedDescription)"
+          + "configuration change, after \(attempt) attempts: "
+          + "\(startError.localizedDescription)"
       )
       return .failed
     }
+    restartAttempts.withLock { $0 = 0 }
     if recordingEnded {
       events.emit(
         healthEvent(
@@ -507,6 +639,28 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     recorder = nil
     self.recorderFormat = nil
     return true
+  }
+
+  /// Replaces the engine with a fresh instance.
+  ///
+  /// `stop()` and `reset()` clear the graph but not the engine's binding to the
+  /// hardware it was created against. A Bluetooth connect moves the default
+  /// *output* as well as the input, and an input-only `AVAudioEngine` still
+  /// owns an output unit, so a stale binding refuses to start with
+  /// `kAudioUnitErr_FormatNotSupported` (-10868) however long it is retried.
+  /// Only a new instance rebinds both sides.
+  ///
+  /// The configuration observer is registered against a specific engine object,
+  /// so it has to move with it or this session stops hearing about transitions
+  /// entirely. It is re-registered before the caller starts the new engine, for
+  /// the same reason `start()` registers before starting: the change that the
+  /// start itself provokes must not race the registration.
+  private func recreateEngineLocked() {
+    removeConfigurationObserverLocked()
+    engine.inputNode.removeTap(onBus: 0)
+    engine.stop()
+    engine = AVAudioEngine()
+    observeConfigurationChangesLocked()
   }
 
   private func observeConfigurationChangesLocked() {
@@ -548,14 +702,6 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
     setActivityHold(false)
     let failed = failureScheduled.withLock { $0 }
     mailbox.finish(discardBuffered: discardBuffered || failed)
-    #if os(iOS)
-      if wasRunning {
-        try? AVAudioSession.sharedInstance().setActive(
-          false,
-          options: .notifyOthersOnDeactivation
-        )
-      }
-    #endif
     lifecycle.unlock()
     if wasRunning, !discardBuffered, !failed {
       emitTrailingDropHealth()
@@ -663,11 +809,18 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
       if resetConverter {
         converter?.reset()
       }
-      do {
-        try recorder?.write(work.buffer)
-      } catch {
-        fail(code: "RecordingWriteFailed", message: error.localizedDescription)
-        return
+      guard ensureConverterMatches(work.buffer.format) else { return }
+      // A format change under a running tap would make the source-native WAV
+      // inconsistent, and writing a mismatched buffer throws. Stop feeding the
+      // auxiliary recording rather than failing the capture over it; the
+      // reinstall path closes the file and reports it.
+      if recorderFormat == nil || recorderFormat == work.buffer.format {
+        do {
+          try recorder?.write(work.buffer)
+        } catch {
+          fail(code: "RecordingWriteFailed", message: error.localizedDescription)
+          return
+        }
       }
       guard
         let converted = converter?.convert(work.buffer),
@@ -684,6 +837,49 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
         return
       }
     }
+  }
+
+  /// Keeps the converter bound to the format the buffers actually carry.
+  ///
+  /// The tap is installed without an asserted format, so the hardware can move
+  /// under a running tap and the next buffer simply arrives in the new one. The
+  /// converter built at prepare or reinstall time is a first guess; this is
+  /// what keeps it true. Returns false once the session has been failed.
+  ///
+  /// Runs on `workerQueue` and must never take `lifecycle`: `reinstallTap`
+  /// holds that lock while it drains this queue, so reaching for it here would
+  /// deadlock against the rebuild it is waiting on.
+  private func ensureConverterMatches(_ bufferFormat: AVAudioFormat) -> Bool {
+    if let converter, converter.inputFormat == bufferFormat { return true }
+    guard
+      let rebuilt = PersistentAudioConverter(
+        inputFormat: bufferFormat,
+        sampleRate: Double(request.outputFormat.sampleRate),
+        channelCount: AVAudioChannelCount(request.outputFormat.channelCount)
+      )
+    else {
+      fail(
+        code: "ConverterUnavailable",
+        message: "Could not convert microphone format \(bufferFormat)"
+      )
+      return false
+    }
+    converter = rebuilt
+    // The samples lost while the hardware moved belong in the stream as a
+    // discontinuity, not spliced silently onto the previous format's audio.
+    assembler?.markSourceRestart()
+    events.emit(
+      healthEvent(
+        phase: .interrupted,
+        code: "MicrophoneBufferFormatChanged",
+        message:
+          "The microphone delivered a new format (\(bufferFormat)); the "
+          + "converter was rebuilt for it.",
+        receivingAudio: false,
+        statistics: assembler?.statistics()
+      )
+    )
+    return true
   }
 
   private func emitTrailingDropHealth() {
@@ -846,20 +1042,6 @@ final class MicrophoneCaptureSession: NativeCaptureSession {
 
 enum AudioInputDevices {
   static func list() -> [AudioInputDeviceMessage] {
-    #if os(macOS)
-      return AudioInputDeviceSelection.listDevices()
-    #elseif os(iOS)
-      let session = AVAudioSession.sharedInstance()
-      let inputs = session.availableInputs ?? []
-      let selectedUid =
-        session.preferredInput?.uid ?? session.currentRoute.inputs.first?.uid
-      return inputs.map { input in
-        AudioInputDeviceMessage(
-          id: input.uid,
-          label: input.portName,
-          isDefault: input.uid == selectedUid
-        )
-      }
-    #endif
+    AudioInputDeviceSelection.listDevices()
   }
 }

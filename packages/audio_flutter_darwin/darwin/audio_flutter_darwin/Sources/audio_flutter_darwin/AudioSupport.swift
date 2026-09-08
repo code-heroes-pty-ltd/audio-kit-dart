@@ -2,11 +2,7 @@ import AVFoundation
 import Foundation
 import os
 
-#if os(iOS)
-  import Flutter
-#elseif os(macOS)
-  import FlutterMacOS
-#endif
+import FlutterMacOS
 
 enum MonotonicClock {
   static func microseconds(hostTime: UInt64? = nil) -> Int64 {
@@ -55,6 +51,10 @@ enum AudioTypedData {
 /// artifacts.
 final class PersistentAudioConverter {
   let outputFormat: AVAudioFormat
+  /// The format this converter was built to read. Callers that receive buffers
+  /// whose format they did not choose — a tap installed without an asserted
+  /// format — compare against this to know when to rebuild.
+  let inputFormat: AVAudioFormat
   private let converter: AVAudioConverter
 
   init?(inputFormat: AVAudioFormat, sampleRate: Double, channelCount: AVAudioChannelCount) {
@@ -68,7 +68,23 @@ final class PersistentAudioConverter {
       let converter = AVAudioConverter(from: inputFormat, to: output)
     else { return nil }
     outputFormat = output
+    self.inputFormat = inputFormat
     self.converter = converter
+    Self.mapUnmappedOutputChannels(of: converter, inputFormat: inputFormat)
+  }
+
+  /// Points output channels the converter left unmapped at real input channels.
+  private static func mapUnmappedOutputChannels(
+    of converter: AVAudioConverter,
+    inputFormat: AVAudioFormat
+  ) {
+    let inputChannels = Int(inputFormat.channelCount)
+    guard inputChannels > 0 else { return }
+    let map = converter.channelMap
+    guard map.contains(where: { $0.intValue < 0 }) else { return }
+    converter.channelMap = (0..<map.count).map { channel in
+      NSNumber(value: min(channel, inputChannels - 1))
+    }
   }
 
   /// Converts to owned interleaved float32 samples.

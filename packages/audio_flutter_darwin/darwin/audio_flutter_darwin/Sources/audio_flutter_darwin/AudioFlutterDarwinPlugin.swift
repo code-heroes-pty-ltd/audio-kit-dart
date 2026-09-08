@@ -1,10 +1,5 @@
-#if os(iOS)
-  import Flutter
-  import UIKit
-#elseif os(macOS)
-  import Cocoa
-  import FlutterMacOS
-#endif
+import Cocoa
+import FlutterMacOS
 
 public final class AudioFlutterDarwinPlugin: NSObject, FlutterPlugin {
   private let host: DarwinAudioHostApiImpl
@@ -18,26 +13,18 @@ public final class AudioFlutterDarwinPlugin: NSObject, FlutterPlugin {
   }
 
   public static func register(with registrar: FlutterPluginRegistrar) {
-    #if os(iOS)
-      let messenger = registrar.messenger()
-    #elseif os(macOS)
-      let messenger = registrar.messenger
-    #endif
+    let messenger = registrar.messenger
     let events = SessionEventsHandler()
     SessionEventsStreamHandler.register(with: messenger, streamHandler: events)
     let host = DarwinAudioHostApiImpl(events: events)
     DarwinAudioHostApiSetup.setUp(binaryMessenger: messenger, api: host)
     let plugin = AudioFlutterDarwinPlugin(host: host)
 
-    #if os(iOS)
-      registrar.publish(plugin)
-    #elseif os(macOS)
-      let channel = FlutterMethodChannel(
-        name: "audio_flutter_darwin/lifetime",
-        binaryMessenger: messenger
-      )
-      registrar.addMethodCallDelegate(plugin, channel: channel)
-    #endif
+    let channel = FlutterMethodChannel(
+      name: "audio_flutter_darwin/lifetime",
+      binaryMessenger: messenger
+    )
+    registrar.addMethodCallDelegate(plugin, channel: channel)
   }
 
   public func handle(
@@ -46,11 +33,5 @@ public final class AudioFlutterDarwinPlugin: NSObject, FlutterPlugin {
   ) {
     result(FlutterMethodNotImplemented)
   }
-
-  #if os(iOS)
-    public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
-      host.teardown()
-    }
-  #endif
 }
 
